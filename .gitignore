@@ -1,0 +1,12 @@
+# Never commit these
+*.sql
+blobs/
+quay-backup-*/
+managed-secret-keys.yaml
+config-bundle.yaml
+quay-config.yaml
+*.env
+.env*
+*-secrets.yaml
+/tmp/
+reset_pw.sql
