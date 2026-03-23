@@ -1,0 +1,27 @@
+name: Validate Blueprint YAML
+
+on:
+  pull_request:
+    paths:
+      - 'customer/**'
+      - 'internal/**'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install yamllint
+      run: pip install yamllint
+
+    - name: Lint customer blueprint YAML
+      run: yamllint -d relaxed customer/
+
+    - name: Check internal shell script syntax
+      run: |
+        for script in internal/scripts/*.sh; do
+          echo "Checking: $script"
+          bash -n "$script" && echo "  ✓ OK"
+        done

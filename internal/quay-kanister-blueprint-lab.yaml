@@ -1,0 +1,728 @@
+# =============================================================================
+# Kanister Blueprint — Red Hat Quay Operator
+# Version:   2.1.0-lab  (lab — enforces replicas:1, 90s HPA suppression loop, retry on conflict)
+#
+# Changes from v1.4.0:
+#   FIX 1 — Workload annotation:
+#     - backup kind: Deployment (was Namespace)
+#     - backup phases use {{ .Deployment.Namespace }} (was .Namespace.Name)
+#     - restore/delete kind removed (Kasten injects namespace on restore)
+#     - Annotate quay-registry-quay-app Deployment (not QuayRegistry CR)
+#   FIX 2 — DROP DATABASE uses quoted name (handles hyphens)
+#   FIX 3 — Stale secret cleanup added to restoreConfig phase
+#   FIX 4 — Password reset + Redis flush added as final restore phase
+#
+# Changes from v2.0.0 → v2.1.0:
+#   - kando push: replaced --dir/--input-file with tar|stdin
+#   - kando pull: removed unsupported trailing - positional arg
+#   - {{ .Deployment.Namespace }} used throughout restore + delete
+#   - Kasten restore requires excluding: services, hpa, deployments,
+#     replicasets, endpoints to avoid Quay Operator conflicts
+#
+# Deploy:
+#   kubectl apply -f 04_quay-kanister-blueprint.yaml -n kasten-io
+#
+# Annotate the PRIMARY QUAY DEPLOYMENT (not the QuayRegistry CR):
+#   kubectl annotate deployment quay-registry-quay-app \
+#     -n quay \
+#     kanister.kasten.io/blueprint='quay-operator-blueprint' \
+#     --overwrite
+# =============================================================================
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: quay-operator-blueprint-lab
+  namespace: kasten-io
+
+actions:
+
+  # ---------------------------------------------------------------------------
+  # BACKUP ACTION
+  # kind: Deployment — blueprint annotated on quay-registry-quay-app Deployment
+  # Template var: {{ .Deployment.Namespace }} for the source namespace
+  #
+  # Phase order (production-validated):
+  #   1. backupConfig   — export CR, secrets, config bundle
+  #   2. backupDatabase — pg_dump while postgres accessible (BEFORE scale down)
+  #   3. backupStorage  — aws s3 sync NooBaa bucket (BEFORE scale down)
+  #   4. scaleDown      — disable HPA; set replicas to 0
+  #   5. scaleUp        — re-enable HPA and managed components
+  # ---------------------------------------------------------------------------
+  backup:
+    kind: Deployment
+    outputArtifacts:
+      quayBackup:
+        kopiaSnapshot: "{{ .Phases.backupStorage.Output.kopiaSnapshot }}"
+
+    phases:
+
+    # ---- Phase 1: Backup Config/Secrets ------------------------------------
+    - func: KubeTask
+      name: backupConfig
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            NAMESPACE="{{ .Deployment.Namespace }}"
+            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+            WORKDIR="/tmp/quay-backup"
+            mkdir -p "${WORKDIR}"
+
+            # --- QuayRegistry CR ---
+            echo "[backupConfig] Exporting QuayRegistry CR..."
+            oc get quayregistry "${CR_NAME}" -n "${NAMESPACE}" -o yaml \
+              > "${WORKDIR}/quay-registry.yaml"
+
+            # Decoded: strips status, creationTimestamp, finalizers, generation, resourceVersion, uid
+            echo "aW1wb3J0IHlhbWwsIHN5cwpwYXRoID0gc3lzLmFyZ3ZbMV0Kd2l0aCBvcGVuKHBhdGgpIGFzIGY6CiAgICBkb2MgPSB5YW1sLnNhZmVfbG9hZChmKQpkb2MucG9wKCdzdGF0dXMnLCBOb25lKQpmb3IgZmllbGQgaW4gWydjcmVhdGlvblRpbWVzdGFtcCcsJ2ZpbmFsaXplcnMnLCdnZW5lcmF0aW9uJywncmVzb3VyY2VWZXJzaW9uJywndWlkJ106CiAgICBkb2MuZ2V0KCdtZXRhZGF0YScsIHt9KS5wb3AoZmllbGQsIE5vbmUpCndpdGggb3BlbihwYXRoLCAndycpIGFzIGY6CiAgICB5YW1sLmR1bXAoZG9jLCBmLCBkZWZhdWx0X2Zsb3dfc3R5bGU9RmFsc2UpCnByaW50KCJDbGVhbmVkOiAiICsgcGF0aCkK" \
+              | base64 -d > /tmp/clean_cr.py
+            python3 /tmp/clean_cr.py "${WORKDIR}/quay-registry.yaml"
+
+            # --- Managed Secret Keys ---
+            echo "[backupConfig] Exporting managed-secret-keys..."
+            SECRET_NAME="${CR_NAME}-quay-registry-managed-secret-keys"
+            oc get secret -n "${NAMESPACE}" "${SECRET_NAME}" -o yaml \
+              > "${WORKDIR}/managed-secret-keys.yaml"
+
+            # Decoded: strips ownerReferences, creationTimestamp, resourceVersion, uid
+            echo "aW1wb3J0IHlhbWwsIHN5cwpwYXRoID0gc3lzLmFyZ3ZbMV0Kd2l0aCBvcGVuKHBhdGgpIGFzIGY6CiAgICBkb2MgPSB5YW1sLnNhZmVfbG9hZChmKQpmb3IgZmllbGQgaW4gWydvd25lclJlZmVyZW5jZXMnLCdjcmVhdGlvblRpbWVzdGFtcCcsJ3Jlc291cmNlVmVyc2lvbicsJ3VpZCddOgogICAgZG9jLmdldCgnbWV0YWRhdGEnLCB7fSkucG9wKGZpZWxkLCBOb25lKQp3aXRoIG9wZW4ocGF0aCwgJ3cnKSBhcyBmOgogICAgeWFtbC5kdW1wKGRvYywgZiwgZGVmYXVsdF9mbG93X3N0eWxlPUZhbHNlKQpwcmludCgiQ2xlYW5lZDogIiArIHBhdGgpCg==" \
+              | base64 -d > /tmp/clean_secret.py
+            python3 /tmp/clean_secret.py "${WORKDIR}/managed-secret-keys.yaml"
+
+            # --- Config Bundle Secret ---
+            echo "[backupConfig] Exporting configBundleSecret..."
+            CONFIG_SECRET=$(oc get quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
+              -o jsonpath='{.spec.configBundleSecret}')
+            oc get secret -n "${NAMESPACE}" "${CONFIG_SECRET}" -o yaml \
+              > "${WORKDIR}/config-bundle.yaml"
+
+            echo "[backupConfig] Artifacts:"
+            ls -lh "${WORKDIR}/"
+
+            tar -czf - -C "${WORKDIR}" . | kando location push \
+              --profile '{{ toJson .Profile }}' \
+              --path "quay-backups/{{ .Deployment.Namespace }}/config/config.tar.gz" \
+              --output-name configOutput -
+            echo "[backupConfig] Done."
+
+    # ---- Phase 2: Backup PostgreSQL Database --------------------------------
+    - func: KubeTask
+      name: backupDatabase
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            NAMESPACE="{{ .Deployment.Namespace }}"
+            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+            WORKDIR="/tmp/quay-backup"
+            mkdir -p "${WORKDIR}"
+
+            PG_POD=$(oc get pod -l quay-component=postgres \
+              -n "${NAMESPACE}" \
+              -o jsonpath='{.items[0].metadata.name}')
+            echo "[backupDatabase] PostgreSQL pod: ${PG_POD}"
+
+            # Get DB name directly from psql — avoids awk parsing corruption
+            # from special characters in DB_URI password field
+            DB_NAME=$(oc -n "${NAMESPACE}" rsh "${PG_POD}" \
+              bash -c 'psql -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('"'"'postgres'"'"','"'"'template0'"'"','"'"'template1'"'"');"')
+
+            echo "[backupDatabase] DB name: ${DB_NAME} (length: ${#DB_NAME})"
+
+            # Sanity check — fall back to convention if corrupted
+            if [[ ${#DB_NAME} -lt 5 || ${#DB_NAME} -gt 60 ]]; then
+              echo "[backupDatabase] WARNING: DB name looks corrupt, using fallback"
+              DB_NAME="${CR_NAME}-quay-database"
+            fi
+            echo "[backupDatabase] Using DB: ${DB_NAME}"
+
+            oc -n "${NAMESPACE}" exec "${PG_POD}" -- \
+              /usr/bin/pg_dump -C "${DB_NAME}" \
+              > "${WORKDIR}/backup.sql"
+
+            echo "[backupDatabase] Dump size: $(du -sh ${WORKDIR}/backup.sql)"
+
+            cat "${WORKDIR}/backup.sql" | kando location push \
+              --profile '{{ toJson .Profile }}' \
+              --path "quay-backups/{{ .Deployment.Namespace }}/database/backup.sql" \
+              --output-name databaseOutput -
+            echo "[backupDatabase] Done."
+
+    # ---- Phase 3: Backup Object Storage (NooBaa) ----------------------------
+    - func: KubeTask
+      name: backupStorage
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            NAMESPACE="{{ .Deployment.Namespace }}"
+            BLOBS_DIR="/tmp/quay-backup/blobs"
+            mkdir -p "${BLOBS_DIR}"
+
+            export AWS_ACCESS_KEY_ID=$(oc get secret -l app=noobaa \
+              -n "${NAMESPACE}" \
+              -o jsonpath='{.items[0].data.AWS_ACCESS_KEY_ID}' | base64 -d)
+
+            export AWS_SECRET_ACCESS_KEY=$(oc get secret -l app=noobaa \
+              -n "${NAMESPACE}" \
+              -o jsonpath='{.items[0].data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
+
+            S3_ENDPOINT=$(oc get route s3 -n openshift-storage \
+              -o jsonpath='{.spec.host}')
+
+            BUCKET_NAME=$(oc get cm -l app=noobaa -n "${NAMESPACE}" \
+              -o jsonpath='{.items[0].data.BUCKET_NAME}')
+
+            echo "[backupStorage] S3 Endpoint : ${S3_ENDPOINT}"
+            echo "[backupStorage] Bucket Name : ${BUCKET_NAME}"
+
+            aws s3 sync \
+              --no-verify-ssl \
+              --endpoint "https://${S3_ENDPOINT}" \
+              "s3://${BUCKET_NAME}" \
+              "${BLOBS_DIR}"
+
+            echo "[backupStorage] Files synced: $(find ${BLOBS_DIR} -type f | wc -l)"
+
+            # tar blobs dir and push via stdin
+            # --output-name kopiaSnapshot emits the artifact consumed by outputArtifacts
+            tar -czf - -C "${BLOBS_DIR}" . | kando location push \
+              --profile '{{ toJson .Profile }}' \
+              --path "quay-backups/{{ .Deployment.Namespace }}/blobs/blobs.tar.gz" \
+              --output-name kopiaSnapshot -
+            echo "[backupStorage] Done."
+
+    # ---- Phase 4: Scale Down ------------------------------------------------
+    - func: KubeTask
+      name: scaleDown
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            NAMESPACE="{{ .Deployment.Namespace }}"
+            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+
+            echo "[scaleDown] Disabling HPA..."
+            oc patch quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
+              --type=merge \
+              -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false}]}}'
+            sleep 10
+
+            echo "[scaleDown] Setting quay/clair/mirror replicas to 0..."
+            oc patch quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
+              --type=merge \
+              -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":0}},{"kind":"clair","managed":true,"overrides":{"replicas":0}},{"kind":"mirror","managed":true,"overrides":{"replicas":0}}]}}'
+
+            oc wait pod -l app=quay   -n "${NAMESPACE}" --for=delete --timeout=300s 2>/dev/null || true
+            oc wait pod -l app=clair  -n "${NAMESPACE}" --for=delete --timeout=300s 2>/dev/null || true
+            oc wait pod -l app=mirror -n "${NAMESPACE}" --for=delete --timeout=300s 2>/dev/null || true
+            echo "[scaleDown] Done."
+
+    # ---- Phase 5: Scale Up --------------------------------------------------
+    - func: KubeTask
+      name: scaleUp
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            NAMESPACE="{{ .Deployment.Namespace }}"
+            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+
+            echo "[scaleUp] Re-enabling HPA..."
+            oc patch quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
+              --type=merge \
+              -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":true}]}}'
+            sleep 10
+
+            echo "[scaleUp] Restoring managed components..."
+            oc patch quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
+              --type=merge \
+              -p '{"spec":{"components":[{"kind":"quay","managed":true},{"kind":"clair","managed":true},{"kind":"mirror","managed":true}]}}'
+
+            echo "[scaleUp] Waiting for Quay to be Available..."
+            oc wait quayregistry "${CR_NAME}" \
+              --for=condition=Available=true \
+              -n "${NAMESPACE}" \
+              --timeout=600s
+            echo "[scaleUp] Quay is Available."
+
+  # ---------------------------------------------------------------------------
+  # RESTORE ACTION
+  # No kind field — Kasten injects the DR namespace context on restore
+  # Template var: {{ .Deployment.Namespace }} for the DR namespace
+  #
+  # Phase order (production-validated):
+  #   1. restoreConfig   — clean DR namespace; apply managed-secret-keys + CR
+  #   2. waitForQuay     — wait for bootstrap; patch config; flush Redis
+  #   3. scaleDownDR     — scale down before DB restore; delete HPA objects
+  #   4. restoreDatabase — drop (quoted) + restore DB from backup
+  #   5. restoreStorage  — sync blobs to DR NooBaa bucket
+  #   6. scaleUpDR       — bring up with replicas:1; delete HPA twice
+  #   7. resetPassword   — bcrypt hash + DB update + Redis flush
+  # ---------------------------------------------------------------------------
+  restore:
+    inputArtifactNames:
+      - quayBackup
+
+    phases:
+
+    # ---- Phase 1: Restore Config/Secrets ------------------------------------
+    # FIX 3: Stale secret cleanup added before applying any secrets
+    # The DR namespace may have leftover secrets from a previous restore attempt
+    # that will conflict. These must be removed before applying the backup secrets.
+    - func: KubeTask
+      name: restoreConfig
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            DR_NAMESPACE="{{ .Deployment.Namespace }}"
+            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+            SOURCE_NS='{{if index .Options "sourceNamespace"}}{{- index .Options "sourceNamespace" -}}{{else}}quay{{end}}'
+            WORKDIR="/tmp/quay-restore"
+            mkdir -p "${WORKDIR}"
+
+            # --- Stale secret cleanup (FIX 3) ---
+            # Remove any stale Quay secrets from previous restore attempts
+            # System dockercfg secrets are preserved
+            echo "[restoreConfig] Cleaning stale Quay secrets from ${DR_NAMESPACE}..."
+            oc get secrets -n "${DR_NAMESPACE}" --no-headers \
+              | grep -v "dockercfg\|default-token\|pipeline\|builder\|deployer" \
+              | awk '{print $1}' \
+              | xargs -r oc delete secret -n "${DR_NAMESPACE}" 2>/dev/null || true
+            echo "[restoreConfig] Stale secrets cleaned"
+
+            # --- Pull config artifacts from object store ---
+            kando location pull \
+              --profile '{{ toJson .Profile }}' \
+              --path "quay-backups/${SOURCE_NS}/config/config.tar.gz" \
+              | tar -xzf - -C "${WORKDIR}"
+
+            # --- Patch namespace references source → DR ---
+            for f in quay-registry.yaml managed-secret-keys.yaml config-bundle.yaml; do
+              sed -i "s/namespace: ${SOURCE_NS}/namespace: ${DR_NAMESPACE}/g" \
+                "${WORKDIR}/${f}"
+              echo "[restoreConfig] Patched namespace in ${f}"
+            done
+
+            # --- Apply managed-secret-keys FIRST ---
+            # Must be applied before the QuayRegistry CR
+            oc create -f "${WORKDIR}/managed-secret-keys.yaml" 2>/dev/null \
+              || oc replace -f "${WORKDIR}/managed-secret-keys.yaml"
+            echo "[restoreConfig] Managed secret keys applied"
+
+            # --- Strip configBundleSecret from CR ---
+            # CRITICAL: Do NOT pre-create the config bundle secret.
+            # The operator deletes any externally-owned secrets immediately.
+            # Let the operator bootstrap it fresh, then patch config in Phase 2.
+            # Decoded: removes configBundleSecret from spec
+            echo "aW1wb3J0IHlhbWwsIHN5cwpwYXRoID0gc3lzLmFyZ3ZbMV0Kd2l0aCBvcGVuKHBhdGgpIGFzIGY6CiAgICBkb2MgPSB5YW1sLnNhZmVfbG9hZChmKQpkb2MuZ2V0KCdzcGVjJywge30pLnBvcCgnY29uZmlnQnVuZGxlU2VjcmV0JywgTm9uZSkKd2l0aCBvcGVuKHBhdGgsICd3JykgYXMgZjoKICAgIHlhbWwuZHVtcChkb2MsIGYsIGRlZmF1bHRfZmxvd19zdHlsZT1GYWxzZSkKcHJpbnQoIlJlbW92ZWQgY29uZmlnQnVuZGxlU2VjcmV0IGZyb206ICIgKyBwYXRoKQo=" \
+              | base64 -d > /tmp/strip_config.py
+            python3 /tmp/strip_config.py "${WORKDIR}/quay-registry.yaml"
+
+            oc create -f "${WORKDIR}/quay-registry.yaml" 2>/dev/null \
+              || echo "[restoreConfig] QuayRegistry CR already exists"
+
+            echo "[restoreConfig] Done — operator will bootstrap config bundle secret"
+
+    # ---- Phase 2: Wait for Quay + Patch Config + Flush Redis ----------------
+    # Waits for operator to fully initialize, then patches backed-up config data
+    # into the operator-created secret and flushes Redis cache
+    - func: KubeTask
+      name: waitForQuay
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            DR_NAMESPACE="{{ .Deployment.Namespace }}"
+            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+            SOURCE_NS='{{if index .Options "sourceNamespace"}}{{- index .Options "sourceNamespace" -}}{{else}}quay{{end}}'
+
+            echo "[waitForQuay] Waiting for QuayRegistry to become Available..."
+            oc wait quayregistry "${CR_NAME}" \
+              --for=condition=Available=true \
+              -n "${DR_NAMESPACE}" \
+              --timeout=900s
+            echo "[waitForQuay] Quay is Available in ${DR_NAMESPACE}"
+
+            # Get the name of the secret the operator created
+            NEW_SECRET=$(oc get quayregistry "${CR_NAME}" \
+              -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.spec.configBundleSecret}')
+            echo "[waitForQuay] Operator config bundle secret: ${NEW_SECRET}"
+
+            # Get config.yaml data from source namespace
+            SOURCE_SECRET=$(oc get quayregistry "${CR_NAME}" \
+              -n "${SOURCE_NS}" \
+              -o jsonpath='{.spec.configBundleSecret}')
+            CONFIG_DATA=$(oc get secret "${SOURCE_SECRET}" \
+              -n "${SOURCE_NS}" \
+              -o jsonpath='{.data.config\.yaml}')
+
+            # Patch backed-up config into the operator-created secret
+            oc patch secret "${NEW_SECRET}" \
+              -n "${DR_NAMESPACE}" \
+              --type=merge \
+              -p "{\"data\":{\"config.yaml\":\"${CONFIG_DATA}\"}}"
+            echo "[waitForQuay] Config data patched into ${NEW_SECRET}"
+
+            # Flush Redis cache to pick up new config immediately
+            REDIS_POD=$(oc get pod -l quay-component=redis \
+              -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.items[0].metadata.name}')
+            oc rsh -n "${DR_NAMESPACE}" "${REDIS_POD}" \
+              bash -c "redis-cli FLUSHALL" || true
+            echo "[waitForQuay] Redis cache flushed"
+
+    # ---- Phase 3: Scale Down DR Quay (LAB) -------------------------------------
+    # LAB: Retry-loop on HPA deletion to handle operator resource version conflicts
+    # The operator continuously reconciles HPA objects — we must wait for it
+    # to settle before deleting, otherwise we get "object has been modified" errors
+    - func: KubeTask
+      name: scaleDownDR
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            DR_NAMESPACE="{{ .Deployment.Namespace }}"
+            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+
+            # Step 1: Disable HPA management first — stop operator creating new HPAs
+            echo "[scaleDownDR] Disabling HPA management..."
+            oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+              --type=merge \
+              -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false}]}}'
+
+            # Step 2: Wait for operator to settle before touching HPA objects
+            echo "[scaleDownDR] Waiting 15s for operator to settle..."
+            sleep 15
+
+            # Step 3: Delete HPA with retry loop — handles resource version conflicts
+            echo "[scaleDownDR] Deleting HPA objects with retry..."
+            for i in $(seq 1 5); do
+              oc delete hpa --all -n "${DR_NAMESPACE}" --ignore-not-found 2>/dev/null && break
+              echo "[scaleDownDR] Retry ${i}/5 after conflict..."
+              sleep 5
+            done
+
+            # Step 4: Zero out replicas
+            echo "[scaleDownDR] Setting replicas to 0..."
+            oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+              --type=merge \
+              -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":0}},{"kind":"clair","managed":true,"overrides":{"replicas":0}},{"kind":"mirror","managed":true,"overrides":{"replicas":0}}]}}'
+
+            # Step 5: Final HPA cleanup after replicas patched
+            sleep 5
+            oc delete hpa --all -n "${DR_NAMESPACE}" --ignore-not-found 2>/dev/null || true
+
+            oc wait pod -l app=quay  -n "${DR_NAMESPACE}" --for=delete --timeout=300s 2>/dev/null || true
+            oc wait pod -l app=clair -n "${DR_NAMESPACE}" --for=delete --timeout=300s 2>/dev/null || true
+            echo "[scaleDownDR] Quay scaled to 0 in ${DR_NAMESPACE}"
+
+    # ---- Phase 4: Restore PostgreSQL Database --------------------------------
+    # FIX 2: DROP DATABASE uses quoted name to handle hyphens in DB name
+    # e.g. "quay-registry-quay-database" requires quoting in psql
+    - func: KubeTask
+      name: restoreDatabase
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            DR_NAMESPACE="{{ .Deployment.Namespace }}"
+            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+            SOURCE_NS='{{if index .Options "sourceNamespace"}}{{- index .Options "sourceNamespace" -}}{{else}}quay{{end}}'
+            WORKDIR="/tmp/quay-restore"
+            mkdir -p "${WORKDIR}"
+
+            kando location pull \
+              --profile '{{ toJson .Profile }}' \
+              --path "quay-backups/${SOURCE_NS}/database/backup.sql" \
+              > "${WORKDIR}/backup.sql"
+
+            PG_POD=$(oc get pod -l quay-component=postgres \
+              -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.items[0].metadata.name}')
+            echo "[restoreDatabase] PostgreSQL pod: ${PG_POD}"
+
+            # Get DB name directly from psql — avoids awk parsing corruption
+            DB_NAME=$(oc -n "${DR_NAMESPACE}" rsh "${PG_POD}" \
+              bash -c 'psql -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('"'"'postgres'"'"','"'"'template0'"'"','"'"'template1'"'"');"')
+
+            echo "[restoreDatabase] DB name: ${DB_NAME} (length: ${#DB_NAME})"
+
+            if [[ ${#DB_NAME} -lt 5 || ${#DB_NAME} -gt 60 ]]; then
+              DB_NAME="${CR_NAME}-quay-database"
+            fi
+            echo "[restoreDatabase] Using DB: ${DB_NAME}"
+
+            # Copy backup into postgres pod
+            oc cp "${WORKDIR}/backup.sql" \
+              -n "${DR_NAMESPACE}" \
+              "${PG_POD}:/tmp/backup.sql"
+
+            # Terminate active connections
+            oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
+              psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${DB_NAME}';" || true
+
+            # FIX 2: DROP DATABASE with quoted name — handles hyphens correctly
+            oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
+              psql -c "DROP DATABASE IF EXISTS \"${DB_NAME}\";" || true
+
+            # Restore from backup
+            oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
+              bash -c "psql < /tmp/backup.sql"
+
+            # Verify restore
+            oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
+              psql -tAc "SELECT datname FROM pg_database WHERE datname = '${DB_NAME}'"
+            echo "[restoreDatabase] Done."
+
+    # ---- Phase 5: Restore Object Storage ------------------------------------
+    - func: KubeTask
+      name: restoreStorage
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            DR_NAMESPACE="{{ .Deployment.Namespace }}"
+            SOURCE_NS='{{if index .Options "sourceNamespace"}}{{- index .Options "sourceNamespace" -}}{{else}}quay{{end}}'
+            BLOBS_DIR="/tmp/quay-restore/blobs"
+            mkdir -p "${BLOBS_DIR}"
+
+            kando location pull \
+              --profile '{{ toJson .Profile }}' \
+              --path "quay-backups/${SOURCE_NS}/blobs/blobs.tar.gz" \
+              | tar -xzf - -C "${BLOBS_DIR}"
+
+            export AWS_ACCESS_KEY_ID=$(oc get secret -l app=noobaa \
+              -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.items[0].data.AWS_ACCESS_KEY_ID}' | base64 -d)
+
+            export AWS_SECRET_ACCESS_KEY=$(oc get secret -l app=noobaa \
+              -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.items[0].data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
+
+            S3_ENDPOINT=$(oc get route s3 -n openshift-storage \
+              -o jsonpath='{.spec.host}')
+
+            BUCKET_NAME=$(oc get cm -l app=noobaa -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.items[0].data.BUCKET_NAME}')
+
+            echo "[restoreStorage] S3 Endpoint : ${S3_ENDPOINT}"
+            echo "[restoreStorage] Bucket Name : ${BUCKET_NAME}"
+
+            aws s3 sync \
+              --no-verify-ssl \
+              --endpoint "https://${S3_ENDPOINT}" \
+              "${BLOBS_DIR}" \
+              "s3://${BUCKET_NAME}"
+            echo "[restoreStorage] Done."
+
+    # ---- Phase 6: Scale Up DR Quay (LAB) ---------------------------------------
+    # LAB: Enforces replicas:1 on ALL scaleable components
+    # HPA is disabled and deleted in a 90s loop to outlast operator reconcile
+    # This prevents CPU request exhaustion on shared bare-metal cluster
+    - func: KubeTask
+      name: scaleUpDR
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            DR_NAMESPACE="{{ .Deployment.Namespace }}"
+            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+
+            echo "[scaleUpDR] LAB: Disabling HPA and enforcing replicas:1..."
+            oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+              --type=merge \
+              -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":1}},{"kind":"clair","managed":true,"overrides":{"replicas":1}},{"kind":"mirror","managed":true,"overrides":{"replicas":1}}]}}'
+
+            # Delete HPA objects in a 90s loop to outlast operator reconcile
+            echo "[scaleUpDR] Suppressing HPA for 90s..."
+            for i in $(seq 1 9); do
+              echo "[scaleUpDR] HPA suppression iteration ${i}/9..."
+              oc delete hpa --all -n "${DR_NAMESPACE}" 2>/dev/null || true
+              sleep 10
+            done
+
+            # Final patch to lock in replicas:1 after suppression window
+            echo "[scaleUpDR] Final patch to lock replicas:1..."
+            oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+              --type=merge \
+              -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":1}},{"kind":"clair","managed":true,"overrides":{"replicas":1}},{"kind":"mirror","managed":true,"overrides":{"replicas":1}}]}}'
+
+            oc delete hpa --all -n "${DR_NAMESPACE}" 2>/dev/null || true
+
+            echo "[scaleUpDR] Waiting for Quay DR to become Available..."
+            oc wait quayregistry "${CR_NAME}" \
+              --for=condition=Available=true \
+              -n "${DR_NAMESPACE}" \
+              --timeout=900s
+
+            # Verify replica counts are correct
+            echo "[scaleUpDR] Verifying pod and HPA state..."
+            oc get pods -n "${DR_NAMESPACE}" --no-headers | grep -v Completed
+            oc get hpa -n "${DR_NAMESPACE}" 2>/dev/null || echo "[scaleUpDR] No HPA found"
+            echo "[scaleUpDR] Quay DR is Available with replicas:1"
+
+    # ---- Phase 7: Reset Password + Flush Redis (FIX 4) ----------------------
+    # After restore the DB contains the source password hash which may not
+    # match the configured password. This phase generates a fresh bcrypt hash
+    # and updates it directly in the DB, then flushes Redis to clear any
+    # cached auth tokens that reference the old hash.
+    # quayAdminUser defaults to 'praveen', quayAdminPassword defaults to 'password'
+    - func: KubeTask
+      name: resetPassword
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            DR_NAMESPACE="{{ .Deployment.Namespace }}"
+            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+            QUAY_USER='{{if index .Options "quayAdminUser"}}{{- index .Options "quayAdminUser" -}}{{else}}praveen{{end}}'
+            QUAY_PASS='{{if index .Options "quayAdminPassword"}}{{- index .Options "quayAdminPassword" -}}{{else}}password{{end}}'
+
+            PG_POD=$(oc get pod -l quay-component=postgres \
+              -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.items[0].metadata.name}')
+            echo "[resetPassword] PostgreSQL pod: ${PG_POD}"
+
+            # Install bcrypt if not present
+            pip3 install bcrypt --quiet 2>/dev/null || true
+
+            # Generate bcrypt hash and write SQL to file
+            # Written to file to avoid shell escaping of $ in hash
+            echo "aW1wb3J0IGJjcnlwdCwgc3VicHJvY2Vzcywgc3lzCnBhc3N3b3JkID0gc3lzLmFyZ3ZbMV0uZW5jb2RlKCd1dGYtOCcpCmhhc2hlZCA9IGJjcnlwdC5oYXNocHcocGFzc3dvcmQsIGJjcnlwdC5nZW5zYWx0KDEyKSkuZGVjb2RlKCd1dGYtOCcpCnVzZXJuYW1lID0gc3lzLmFyZ3ZbMl0Kc3FsID0gZiJVUERBVEUgcHVibGljLnVzZXIgU0VUIHBhc3N3b3JkX2hhc2ggPSAne2hhc2hlZH0nIFdIRVJFIHVzZXJuYW1lID0gJ3t1c2VybmFtZX0nOyIKd2l0aCBvcGVuKCcvdG1wL3Jlc2V0X3B3LnNxbCcsICd3JykgYXMgZjoKICAgIGYud3JpdGUoc3FsKQpwcmludCgiSGFzaCBnZW5lcmF0ZWQgZm9yIHVzZXI6ICIgKyB1c2VybmFtZSkKcHJpbnQoIkhhc2ggcHJldmlldzogIiArIGhhc2hlZFs6MjBdICsgIi4uLiIpCg==" \
+              | base64 -d > /tmp/gen_hash.py
+
+            python3 /tmp/gen_hash.py "${QUAY_PASS}" "${QUAY_USER}"
+
+            # Copy SQL to postgres pod and execute
+            oc cp /tmp/reset_pw.sql \
+              -n "${DR_NAMESPACE}" \
+              "${PG_POD}:/tmp/reset_pw.sql"
+
+            oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
+              psql -d "quay-registry-quay-database" -f /tmp/reset_pw.sql
+
+            echo "[resetPassword] Password updated for user: ${QUAY_USER}"
+
+            # Flush Redis to clear cached auth tokens
+            REDIS_POD=$(oc get pod -l quay-component=redis \
+              -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.items[0].metadata.name}')
+            oc rsh -n "${DR_NAMESPACE}" "${REDIS_POD}" \
+              bash -c "redis-cli FLUSHALL" || true
+            echo "[resetPassword] Redis cache flushed — restore complete"
+
+  # ---------------------------------------------------------------------------
+  # DELETE ACTION
+  # Removes backup artifacts from the object store for a given restore point
+  # ---------------------------------------------------------------------------
+  delete:
+    inputArtifactNames:
+      - quayBackup
+
+    phases:
+    - func: KubeTask
+      name: deleteBackupArtifacts
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            echo "[delete] Removing Quay backup artifacts from object store..."
+            kando location delete \
+              --profile '{{ toJson .Profile }}' \
+              --path "quay-backups/{{ .Deployment.Namespace }}/blobs/blobs.tar.gz" \
+              --kopia-snapshot '{{ .ArtifactsIn.quayBackup.KopiaSnapshot }}'
+            echo "[delete] Backup artifacts deleted."
