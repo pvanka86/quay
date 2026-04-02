@@ -40,14 +40,14 @@
 apiVersion: actions.kio.kasten.io/v1alpha1
 kind: RestoreAction
 metadata:
-  generateName: quay-restore-
-  namespace: kasten-io
+  generateName: quay-dr-restore-
+  namespace: quay-dr                    # must match targetNamespace below
 spec:
   subject:
     apiVersion: apps.kio.kasten.io/v1alpha1
     kind: RestorePoint
     name: <your-restore-point-name>      # required — e.g. scheduled-t4pj4
-    namespace: quay                      # required — namespace restore point lives in
+    namespace: quay                      # required — source namespace (where backup was taken)
   targetNamespace: quay-dr              # required — DR namespace to restore into
 
   hooks:
