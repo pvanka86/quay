@@ -377,11 +377,14 @@ PREBK_POD=$(wait_for_kanister_pod "${SOURCE_NS}" "__none__" "${POD_APPEAR_TIMEOU
 log "preBackupHook pod: ${PREBK_POD}"
 stream_logs "${SOURCE_NS}" "${PREBK_POD}" "${BACKUP_TIMEOUT}"
 
-# Wait up to 60s for pod to reach Succeeded after log stream ends
+# Wait up to 90s for pod to reach Succeeded after log stream ends
 log "Waiting for preBackupHook pod to reach Succeeded..."
 ELAPSED=0
-while [[ ${ELAPSED} -lt 60 ]]; do
-  PREBK_STATUS=$(kubectl get pod "${PREBK_POD}" -n "${SOURCE_NS}"     -o jsonpath='{.status.phase}' 2>/dev/null || echo "Gone")
+while [[ ${ELAPSED} -lt 90 ]]; do
+  PREBK_STATUS=$(kubectl get pod "${PREBK_POD}" -n "${SOURCE_NS}" \
+    -o jsonpath='{.status.phase}' 2>/dev/null || echo "Gone")
+  # Empty phase = transient API state, keep polling
+  [[ -z "${PREBK_STATUS}" ]] && PREBK_STATUS="Running"
   [[ "${PREBK_STATUS}" == "Succeeded" || "${PREBK_STATUS}" == "Gone" ]] && break
   sleep 5; ELAPSED=$((ELAPSED+5))
 done
@@ -399,8 +402,10 @@ if [[ -n "${POSTBK_POD}" ]]; then
   log "postBackupHook pod: ${POSTBK_POD}"
   stream_logs "${SOURCE_NS}" "${POSTBK_POD}" 300
   ELAPSED=0
-  while [[ ${ELAPSED} -lt 60 ]]; do
+  while [[ ${ELAPSED} -lt 90 ]]; do
     POSTBK_STATUS=$(kubectl get pod "${POSTBK_POD}" -n "${SOURCE_NS}"       -o jsonpath='{.status.phase}' 2>/dev/null || echo "Gone")
+    # Empty phase = transient state, keep polling
+    [[ -z "${POSTBK_STATUS}" ]] && POSTBK_STATUS="Running"
     [[ "${POSTBK_STATUS}" == "Succeeded" || "${POSTBK_STATUS}" == "Gone" ]] && break
     sleep 5; ELAPSED=$((ELAPSED+5))
   done
@@ -503,14 +508,23 @@ fi
 # =============================================================================
 # SECTION 6 — TRIGGER RESTORE
 # =============================================================================
-header "SECTION 6 — Trigger DR Restore from ${LATEST_RP}"
+header "SECTION 6 — Trigger DR Restore"
+
+# Get latest restore point — always fetch fresh immediately before restore
+log "Fetching latest restore point from ${SOURCE_NS}..."
+LATEST_RP=$(kubectl get restorepoints -n "${SOURCE_NS}" \
+  --sort-by='.metadata.creationTimestamp' \
+  --no-headers 2>/dev/null | tail -1 | awk '{print $1}' || echo "")
+[[ -z "${LATEST_RP}" ]] && abort "No restore points found in ${SOURCE_NS} — run a backup first"
+log "Using restore point: ${LATEST_RP}"
+check "Restore point available: ${LATEST_RP}" "pass"
 
 RESTORE_OUTPUT=$(kubectl create -f - 2>&1 <<EOF
 apiVersion: actions.kio.kasten.io/v1alpha1
 kind: RestoreAction
 metadata:
   generateName: quay-dr-restore-
-  namespace: ${KASTEN_NS}
+  namespace: ${DR_NS}
 spec:
   subject:
     apiVersion: apps.kio.kasten.io/v1alpha1
@@ -554,6 +568,8 @@ if [[ -n "${POST_RESTORE_POD}" ]]; then
   ELAPSED=0
   while [[ ${ELAPSED} -lt 120 ]]; do
     POST_STATUS=$(kubectl get pod "${POST_RESTORE_POD}" -n "${DR_NS}"       -o jsonpath='{.status.phase}' 2>/dev/null || echo "Gone")
+    # Empty phase = transient state, keep polling
+    [[ -z "${POST_STATUS}" ]] && POST_STATUS="Running"
     [[ "${POST_STATUS}" == "Succeeded" || "${POST_STATUS}" == "Gone" ]] && break
     sleep 5; ELAPSED=$((ELAPSED+5))
   done
@@ -593,25 +609,49 @@ fi
 # =============================================================================
 header "SECTION 7 — Verify DR Restore"
 
+# Wait for QuayRegistry Available=True in DR before checking anything else.
+# The blueprint's postRestoreHook (STEP 11) waits up to 900s internally,
+# but the script polls independently in case the hook pod was missed.
+log "Waiting for DR QuayRegistry Available=True (up to 900s)..."
+ELAPSED=0
+DR_AVAIL=""
+while [[ ${ELAPSED} -lt 900 ]]; do
+  DR_AVAIL=$(oc get quayregistry "${CR_NAME}" -n "${DR_NS}" \
+    -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "")
+  [[ "${DR_AVAIL}" == "True" ]] && break
+  printf "."; sleep 10; ELAPSED=$((ELAPSED+10))
+done
+echo ""
+if [[ "${DR_AVAIL}" == "True" ]]; then
+  check "DR QuayRegistry Available=True" "pass"
+else
+  check "DR QuayRegistry Available=True" "fail"
+  abort "DR QuayRegistry did not reach Available=True within 900s — check postRestoreHook logs"
+fi
+
+# Wait for quay-app pod Running in DR (up to 300s)
+log "Waiting for DR quay-app pod Running (up to 300s)..."
+ELAPSED=0
+DR_APP_POD=""
+while [[ ${ELAPSED} -lt 300 ]]; do
+  DR_APP_POD=$(kubectl get pods -n "${DR_NS}" --no-headers 2>/dev/null \
+    | grep "quay-app" | grep -v "upgrade" | grep "Running" | awk '{print $1}' | head -1 || echo "")
+  [[ -n "${DR_APP_POD}" ]] && break
+  printf "."; sleep 5; ELAPSED=$((ELAPSED+5))
+done
+echo ""
+if [[ -n "${DR_APP_POD}" ]]; then
+  check "DR quay-app Running: ${DR_APP_POD}" "pass"
+else
+  check "DR quay-app Running" "fail"
+  abort "DR quay-app pod did not reach Running within 300s"
+fi
+
 log "Current DR pod state:"
 kubectl get pods -n "${DR_NS}" --no-headers 2>/dev/null \
   | awk '{printf "  %-55s %-10s %-12s %s\n", $1, $2, $3, $4}'
 
-# QuayApp running
-DR_APP=$(kubectl get pods -n "${DR_NS}" --no-headers 2>/dev/null \
-  | grep "quay-app" | grep -c "1/1.*Running" || true)
-[[ "${DR_APP}" -ge 1 ]] \
-  && check "DR quay-app Running" "pass" \
-  || check "DR quay-app Running" "fail"
-
-# QuayRegistry Available
-DR_AVAIL=$(oc get quayregistry "${CR_NAME}" -n "${DR_NS}" \
-  -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "")
-[[ "${DR_AVAIL}" == "True" ]] \
-  && check "DR QuayRegistry Available=True" "pass" \
-  || check "DR QuayRegistry Available=True" "fail"
-
-# DR health endpoint
+# DR route
 DR_ROUTE=$(oc get route -n "${DR_NS}" -o jsonpath='{.items[0].spec.host}' 2>/dev/null || echo "")
 if [[ -z "${DR_ROUTE}" ]]; then
   check "DR Quay route found" "fail"
@@ -619,13 +659,25 @@ if [[ -z "${DR_ROUTE}" ]]; then
 fi
 log "DR Quay route: ${DR_ROUTE}"
 
-DR_HEALTH=$(curl -sk "https://${DR_ROUTE}/health/instance" 2>/dev/null || echo "{}")
+# Wait for health endpoint to respond (up to 120s)
+log "Waiting for DR Quay health endpoint (up to 120s)..."
+ELAPSED=0
+DR_HEALTH="{}"
+while [[ ${ELAPSED} -lt 120 ]]; do
+  DR_HEALTH=$(curl -sk --max-time 5 "https://${DR_ROUTE}/health/instance" 2>/dev/null || echo "{}")
+  if echo "${DR_HEALTH}" | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); assert all(d.get('data',{}).get('services',{}).values())" 2>/dev/null; then
+    break
+  fi
+  printf "."; sleep 10; ELAPSED=$((ELAPSED+10))
+done
+echo ""
 if echo "${DR_HEALTH}" | python3 -c \
   "import sys,json; d=json.load(sys.stdin); assert all(d.get('data',{}).get('services',{}).values())" 2>/dev/null; then
   check "DR Quay health — all services true" "pass"
 else
   check "DR Quay health — all services true" "fail"
-  warn "DR health: ${DR_HEALTH}"
+  warn "DR health response: ${DR_HEALTH}"
 fi
 
 # Clean pull test
