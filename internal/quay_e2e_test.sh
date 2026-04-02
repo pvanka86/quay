@@ -17,6 +17,9 @@
 # phases and reports a full result at the end rather than stopping mid-run.
 set -uo pipefail
 
+# Resolve script directory so relative paths work regardless of invocation location
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # =============================================================================
 # ENVIRONMENT — lab or prod (defaults to lab if no argument given)
 # =============================================================================
@@ -51,7 +54,7 @@ fi
 EXT_S3_ENDPOINT="https://s3.us-east-2.amazonaws.com"
 TEST_IMAGE="docker.io/library/alpine:latest"
 TEST_IMAGE_TAG="alpine:latest"
-CLEANUP_SCRIPT="./quay-dr-cleanup.sh"
+CLEANUP_SCRIPT="${SCRIPT_DIR}/../quay-dr-cleanup.sh"
 
 # Timeouts (seconds)
 BACKUP_TIMEOUT=900
