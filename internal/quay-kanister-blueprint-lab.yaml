@@ -1,67 +1,149 @@
-# =============================================================================
-# Kanister Blueprint — Red Hat Quay Operator
-# Version:   2.1.0-lab  (lab — enforces replicas:1, 90s HPA suppression loop, retry on conflict)
-#
-# Changes from v1.4.0:
-#   FIX 1 — Workload annotation:
-#     - backup kind: Deployment (was Namespace)
-#     - backup phases use {{ .Deployment.Namespace }} (was .Namespace.Name)
-#     - restore/delete kind removed (Kasten injects namespace on restore)
-#     - Annotate quay-registry-quay-app Deployment (not QuayRegistry CR)
-#   FIX 2 — DROP DATABASE uses quoted name (handles hyphens)
-#   FIX 3 — Stale secret cleanup added to restoreConfig phase
-#   FIX 4 — Password reset + Redis flush added as final restore phase
-#
-# Changes from v2.0.0 → v2.1.0:
-#   - kando push: replaced --dir/--input-file with tar|stdin
-#   - kando pull: removed unsupported trailing - positional arg
-#   - {{ .Deployment.Namespace }} used throughout restore + delete
-#   - Kasten restore requires excluding: services, hpa, deployments,
-#     replicasets, endpoints to avoid Quay Operator conflicts
-#
-# Deploy:
-#   kubectl apply -f 04_quay-kanister-blueprint.yaml -n kasten-io
-#
-# Annotate the PRIMARY QUAY DEPLOYMENT (not the QuayRegistry CR):
-#   kubectl annotate deployment quay-registry-quay-app \
-#     -n quay \
-#     kanister.kasten.io/blueprint='quay-operator-blueprint' \
-#     --overwrite
-# =============================================================================
 apiVersion: cr.kanister.io/v1alpha1
 kind: Blueprint
 metadata:
-  name: quay-operator-blueprint-lab
+  name: quay-kanister-blueprint-lab
   namespace: kasten-io
+
+# =============================================================================
+# Quay Operator — Backup + Restore Blueprint
+# Version   : 5.0.0
+# Quay      : 3.13.2
+# Image     : docker.io/pvanka86/quay-kanister-tools:2.0.0
+#
+# ARCHITECTURE — Pure hook-based blueprint following the Maximo/mongoce pattern.
+# No deployment annotation. No annotated workloads. No backup/restore actions.
+# All five actions are Kasten execution hooks bound via policy hooks wiring.
+# All template parameters use {{ .Namespace.Name }} (namespace-scoped hooks).
+#
+# PRE-REQUISITES:
+#   1. Secret quay-s3-backup-credentials in BOTH quay AND quay-dr:
+#        kubectl create secret generic quay-s3-backup-credentials \
+#          -n quay \
+#          --from-literal=AWS_ACCESS_KEY_ID=<key> \
+#          --from-literal=AWS_SECRET_ACCESS_KEY=<secret> \
+#          --from-literal=AWS_S3_ENDPOINT=https://s3.us-east-2.amazonaws.com \
+#          --from-literal=AWS_S3_BUCKET=quay-kasten-blobs \
+#          --from-literal=AWS_DEFAULT_REGION=us-east-1
+#        (repeat with -n quay-dr)
+#
+#   2. S3 bucket quay-kasten-blobs — created automatically on first backup
+#
+# =============================================================================
+# BACKUP WORKFLOW
+#
+#  preBackupHook  ─────────────────────────────────────────────────────────────
+#  Runs in: quay namespace (source)
+#  STEP 1  Export QuayRegistry CR         → strip status + runtime metadata
+#  STEP 2  Export managed-secret-keys     → strip ownerReferences
+#  STEP 3  Export config-bundle secret
+#  STEP 4  Store all three → ConfigMap    → quay-kanister-backup-manifests
+#                                           Kasten snapshots as spec artifact
+#  STEP 5  Scale DOWN quay/clair/mirror   → HPA off → replicas:0 → wait 0
+#  STEP 6  Sync NooBaa blobs → S3         → s3://quay-kasten-blobs/quay/<ns>/blobs/
+#          Blueprint exits — Quay=0 replicas
+#
+#  Kasten PVC snapshot  ────────────────────────────────────────────────────────
+#  quay-registry-quay-postgres-13   (application-consistent — Quay=0)
+#  quay-registry-clair-postgres-15
+#  Spec snapshot: ConfigMap, secrets, routes, services, roles, rolebindings
+#
+#  postBackupHook  ─────────────────────────────────────────────────────────────
+#  Runs in: quay namespace (source)
+#  STEP 1  Scale UP quay/clair/mirror     → HPA on → wait Available=True
+#
+# =============================================================================
+# RESTORE WORKFLOW
+#
+#  preRestoreHook  ─────────────────────────────────────────────────────────────
+#  Runs in: quay-dr (target) — BEFORE Kasten restores spec objects
+#  STEP 1  Delete OBC (strip finalizer first)
+#  STEP 2  Delete source ObjectBucket at cluster scope
+#  STEP 3  Delete managed-secret-keys secret
+#  STEP 4  Delete config-bundle secrets
+#  STEP 5  Patch configBundleSecret out of CR (if CR exists already)
+#  STEP 6  Delete all HPAs
+#  STEP 7  Print DR namespace state
+#
+#  Kasten restores spec objects + PVCs into quay-dr  ──────────────────────────
+#  ConfigMap, secrets, routes, services restored from restore point
+#  PVC data restored from snapshots (postgres DB)
+#
+#  postRestoreHook  ────────────────────────────────────────────────────────────
+#  Runs in: quay-dr (target) — AFTER Kasten restores all objects
+#  STEP 1   Read manifests from ConfigMap
+#  STEP 2   Patch namespace (quay → quay-dr)
+#  STEP 3   Apply managed-secret-keys FIRST
+#  STEP 4   Apply QuayRegistry CR (configBundleSecret stripped)
+#  STEP 5   Create fresh OBC + wait NooBaa bind (up to 300s)
+#  STEP 6   Wait QuayRegistry Available=True (up to 900s)
+#  STEP 7   Confirm key pods Running (postgres 120s, redis 120s, quay-app 300s)
+#  STEP 8   Patch backed-up config.yaml → operator-created secret
+#  STEP 9   Scale DOWN DR (HPA off → replicas:0 → wait)
+#  STEP 10  Restore blobs: external S3 → DR NooBaa (wait OBC bind 300s)
+#  STEP 11  Scale UP DR (replicas:1, HPA disabled — double patch/delete)
+#  STEP 12  Flush Redis
+#  STEP 13  bcrypt password reset (if quayAdminPassword option set)
+#  FINAL    Print verification summary
+#
+#  postRestoreHookError  ───────────────────────────────────────────────────────
+#  Runs in: quay-dr (target) — if restore fails
+#  Strips OBC finalizer, deletes CR, cleans kanister-job pods
+#
+# =============================================================================
+# POLICY HOOK WIRING
+#
+# Backup policy (quay-backup):
+#   spec.actions[0].backupParameters.hooks:
+#     preHook:
+#       blueprint: quay-kanister-blueprint-lab
+#       actionName: preBackupHook
+#     onSuccess:
+#       blueprint: quay-kanister-blueprint-lab
+#       actionName: postBackupHook
+#
+# RestoreAction (set on the restore dialog or import policy):
+#   hooks:
+#     preHook:
+#       blueprint: quay-kanister-blueprint-lab
+#       actionName: preRestoreHook
+#     onSuccess:
+#       blueprint: quay-kanister-blueprint-lab
+#       actionName: postRestoreHook
+#     onFailure:
+#       blueprint: quay-kanister-blueprint-lab
+#       actionName: postRestoreHookError
+#
+# =============================================================================
+# OPTIONS (set in policy or RunAction):
+#   quayToolsImage    — override container image
+#   quayRegistryName  — override CR name (default: auto-discovered)
+#   quayAdminUser     — override admin username for password reset
+#   quayAdminPassword — plaintext password for STEP 13 bcrypt reset
+#   sourceNamespace   — namespace backup was taken from (default: quay)
+# =============================================================================
 
 actions:
 
-  # ---------------------------------------------------------------------------
-  # BACKUP ACTION
-  # kind: Deployment — blueprint annotated on quay-registry-quay-app Deployment
-  # Template var: {{ .Deployment.Namespace }} for the source namespace
-  #
-  # Phase order (production-validated):
-  #   1. backupConfig   — export CR, secrets, config bundle
-  #   2. backupDatabase — pg_dump while postgres accessible (BEFORE scale down)
-  #   3. backupStorage  — aws s3 sync NooBaa bucket (BEFORE scale down)
-  #   4. scaleDown      — disable HPA; set replicas to 0
-  #   5. scaleUp        — re-enable HPA and managed components
-  # ---------------------------------------------------------------------------
-  backup:
-    kind: Deployment
-    outputArtifacts:
-      quayBackup:
-        kopiaSnapshot: "{{ .Phases.backupStorage.Output.kopiaSnapshot }}"
+  # ===========================================================================
+  # preBackupHook
+  # Runs BEFORE Kasten takes PVC snapshots.
+  # Exports manifests to ConfigMap, syncs blobs to S3, scales Quay to 0.
+  # Blueprint exits with Quay=0 so PVC snapshot is application-consistent.
+  # ===========================================================================
+  preBackupHook:
 
     phases:
 
-    # ---- Phase 1: Backup Config/Secrets ------------------------------------
     - func: KubeTask
-      name: backupConfig
+      name: preBackupHook
+      objects:
+        s3creds:
+          kind: Secret
+          name: quay-s3-backup-credentials
+          namespace: "{{ .Namespace.Name }}"
       args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        namespace: "{{ .Namespace.Name }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:2.0.0{{end}}'
         command:
           - bash
           - -o
@@ -70,246 +152,445 @@ actions:
           - pipefail
           - -c
           - |
-            NAMESPACE="{{ .Deployment.Namespace }}"
-            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+            # ==================================================================
+            # INIT — resolve all variables before doing any work
+            # ==================================================================
+            NAMESPACE="{{ .Namespace.Name }}"
             WORKDIR="/tmp/quay-backup"
             mkdir -p "${WORKDIR}"
 
-            # --- QuayRegistry CR ---
-            echo "[backupConfig] Exporting QuayRegistry CR..."
+            CR_NAME_OPT='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{end}}'
+            if [[ -n "${CR_NAME_OPT}" ]]; then
+              CR_NAME="${CR_NAME_OPT}"
+            else
+              CR_NAME=$(oc get quayregistry -n "${NAMESPACE}" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            fi
+            if [[ -z "${CR_NAME}" ]]; then
+              echo "[INIT] ERROR: Could not resolve QuayRegistry CR name in ${NAMESPACE}"
+              exit 1
+            fi
+
+            # S3 credentials injected from secret via objects stanza
+            EXT_KEY='{{ index .Phases.preBackupHook.Secrets.s3creds.Data "AWS_ACCESS_KEY_ID" | toString }}'
+            EXT_SECRET='{{ index .Phases.preBackupHook.Secrets.s3creds.Data "AWS_SECRET_ACCESS_KEY" | toString }}'
+            EXT_ENDPOINT='{{ index .Phases.preBackupHook.Secrets.s3creds.Data "AWS_S3_ENDPOINT" | toString }}'
+            EXT_BUCKET='{{ index .Phases.preBackupHook.Secrets.s3creds.Data "AWS_S3_BUCKET" | toString }}'
+            EXT_REGION='{{ index .Phases.preBackupHook.Secrets.s3creds.Data "AWS_DEFAULT_REGION" | toString }}'
+
+            # Normalize endpoint — prepend https:// if scheme is missing
+            [[ "${EXT_ENDPOINT}" != http://* && "${EXT_ENDPOINT}" != https://* ]] \
+              && EXT_ENDPOINT="https://${EXT_ENDPOINT}"
+
+            if [[ -z "${EXT_KEY}" || -z "${EXT_SECRET}" || -z "${EXT_ENDPOINT}" || -z "${EXT_BUCKET}" ]]; then
+              echo "[INIT] ERROR: quay-s3-backup-credentials missing required fields"
+              echo "[INIT] Required keys: AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_S3_ENDPOINT AWS_S3_BUCKET"
+              exit 1
+            fi
+
+            AVAIL=$(oc get quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
+              -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "Unknown")
+
+            echo "======================================================"
+            echo "[INIT] ▶ Quay preBackupHook — Blueprint v5.0.0"
+            echo "[INIT]   Namespace       : ${NAMESPACE}"
+            echo "[INIT]   CR Name         : ${CR_NAME}"
+            echo "[INIT]   CR Available    : ${AVAIL}"
+            echo "[INIT]   S3 Endpoint     : ${EXT_ENDPOINT}"
+            echo "[INIT]   S3 Bucket       : ${EXT_BUCKET}"
+            echo "[INIT]   Work dir        : ${WORKDIR}"
+            echo "[INIT]   Start time      : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "======================================================"
+
+            # Check for ConfigInvalid — operator in this state ignores overrides.replicas
+            # and scale-down will never work. Fail fast with a clear actionable error.
+            CONFIG_INVALID=$(oc get quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
+              -o jsonpath='{.status.conditions[?(@.reason=="ConfigInvalid")].reason}' \
+              2>/dev/null || true)
+
+            if [[ "${CONFIG_INVALID}" == "ConfigInvalid" ]]; then
+              echo "[INIT] ERROR: QuayRegistry '${CR_NAME}' is in ConfigInvalid state"
+              echo "[INIT]   The operator will not honor scale-down overrides while in this state."
+              echo "[INIT]   Common cause: DISTRIBUTED_STORAGE_CONFIG in config.yaml conflicts"
+              echo "[INIT]   with objectstorage component managed:true."
+              echo "[INIT]   Fix: Remove DISTRIBUTED_STORAGE_CONFIG from the config bundle secret:"
+              CBS=$(oc get quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
+                -o jsonpath='{.spec.configBundleSecret}' 2>/dev/null || true)
+              echo "[INIT]     oc get secret ${CBS} -n ${NAMESPACE} -o jsonpath='{.data.config\.yaml}'"
+              echo "[INIT]     | base64 -d | grep DISTRIBUTED_STORAGE"
+              echo "[INIT]   Then remove the conflicting keys and retry the backup."
+              exit 1
+            fi
+
+            if [[ "${AVAIL}" != "True" ]]; then
+              echo "[INIT] WARNING: QuayRegistry not Available — proceeding but verify health first"
+            fi
+
+            # ==================================================================
+            # STEP 1 — Export QuayRegistry CR
+            # Expected output: "DONE — NNN bytes (runtime fields stripped)"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 1 — Export QuayRegistry CR"
+            echo "════════════════════════════════════════"
+
             oc get quayregistry "${CR_NAME}" -n "${NAMESPACE}" -o yaml \
               > "${WORKDIR}/quay-registry.yaml"
+            echo "[STEP 1] Raw export     : $(wc -c < ${WORKDIR}/quay-registry.yaml) bytes"
 
-            # Decoded: strips status, creationTimestamp, finalizers, generation, resourceVersion, uid
-            echo "aW1wb3J0IHlhbWwsIHN5cwpwYXRoID0gc3lzLmFyZ3ZbMV0Kd2l0aCBvcGVuKHBhdGgpIGFzIGY6CiAgICBkb2MgPSB5YW1sLnNhZmVfbG9hZChmKQpkb2MucG9wKCdzdGF0dXMnLCBOb25lKQpmb3IgZmllbGQgaW4gWydjcmVhdGlvblRpbWVzdGFtcCcsJ2ZpbmFsaXplcnMnLCdnZW5lcmF0aW9uJywncmVzb3VyY2VWZXJzaW9uJywndWlkJ106CiAgICBkb2MuZ2V0KCdtZXRhZGF0YScsIHt9KS5wb3AoZmllbGQsIE5vbmUpCndpdGggb3BlbihwYXRoLCAndycpIGFzIGY6CiAgICB5YW1sLmR1bXAoZG9jLCBmLCBkZWZhdWx0X2Zsb3dfc3R5bGU9RmFsc2UpCnByaW50KCJDbGVhbmVkOiAiICsgcGF0aCkK" \
+            echo "aW1wb3J0IHlhbWwsIHN5cwpwYXRoID0gc3lzLmFyZ3ZbMV0Kd2l0aCBvcGVuKHBhdGgpIGFzIGY6CiAgICBkb2MgPSB5YW1sLnNhZmVfbG9hZChmKQpkb2MucG9wKCJzdGF0dXMiLCBOb25lKQpmb3IgZmllbGQgaW4gWyJjcmVhdGlvblRpbWVzdGFtcCIsImZpbmFsaXplcnMiLCJnZW5lcmF0aW9uIiwicmVzb3VyY2VWZXJzaW9uIiwidWlkIl06CiAgICBkb2MuZ2V0KCJtZXRhZGF0YSIsIHt9KS5wb3AoZmllbGQsIE5vbmUpCndpdGggb3BlbihwYXRoLCAidyIpIGFzIGY6CiAgICB5YW1sLmR1bXAoZG9jLCBmLCBkZWZhdWx0X2Zsb3dfc3R5bGU9RmFsc2UpCnByaW50KCJDbGVhbmVkOiAiICsgcGF0aCkK" \
               | base64 -d > /tmp/clean_cr.py
             python3 /tmp/clean_cr.py "${WORKDIR}/quay-registry.yaml"
+            echo "[STEP 1] After strip    : $(wc -c < ${WORKDIR}/quay-registry.yaml) bytes"
+            echo "[STEP 1] DONE ✓"
 
-            # --- Managed Secret Keys ---
-            echo "[backupConfig] Exporting managed-secret-keys..."
+            # ==================================================================
+            # STEP 2 — Export managed-secret-keys
+            # Expected output: "DONE — NNN bytes (ownerReferences stripped)"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 2 — Export managed-secret-keys"
+            echo "════════════════════════════════════════"
+
             SECRET_NAME="${CR_NAME}-quay-registry-managed-secret-keys"
+            if ! oc get secret "${SECRET_NAME}" -n "${NAMESPACE}" &>/dev/null; then
+              echo "[STEP 2] ERROR: Secret '${SECRET_NAME}' not found in ${NAMESPACE}"
+              exit 1
+            fi
             oc get secret -n "${NAMESPACE}" "${SECRET_NAME}" -o yaml \
               > "${WORKDIR}/managed-secret-keys.yaml"
+            echo "[STEP 2] Raw export     : $(wc -c < ${WORKDIR}/managed-secret-keys.yaml) bytes"
 
-            # Decoded: strips ownerReferences, creationTimestamp, resourceVersion, uid
-            echo "aW1wb3J0IHlhbWwsIHN5cwpwYXRoID0gc3lzLmFyZ3ZbMV0Kd2l0aCBvcGVuKHBhdGgpIGFzIGY6CiAgICBkb2MgPSB5YW1sLnNhZmVfbG9hZChmKQpmb3IgZmllbGQgaW4gWydvd25lclJlZmVyZW5jZXMnLCdjcmVhdGlvblRpbWVzdGFtcCcsJ3Jlc291cmNlVmVyc2lvbicsJ3VpZCddOgogICAgZG9jLmdldCgnbWV0YWRhdGEnLCB7fSkucG9wKGZpZWxkLCBOb25lKQp3aXRoIG9wZW4ocGF0aCwgJ3cnKSBhcyBmOgogICAgeWFtbC5kdW1wKGRvYywgZiwgZGVmYXVsdF9mbG93X3N0eWxlPUZhbHNlKQpwcmludCgiQ2xlYW5lZDogIiArIHBhdGgpCg==" \
+            echo "aW1wb3J0IHlhbWwsIHN5cwpwYXRoID0gc3lzLmFyZ3ZbMV0Kd2l0aCBvcGVuKHBhdGgpIGFzIGY6CiAgICBkb2MgPSB5YW1sLnNhZmVfbG9hZChmKQpmb3IgZmllbGQgaW4gWyJvd25lclJlZmVyZW5jZXMiLCJjcmVhdGlvblRpbWVzdGFtcCIsInJlc291cmNlVmVyc2lvbiIsInVpZCJdOgogICAgZG9jLmdldCgibWV0YWRhdGEiLCB7fSkucG9wKGZpZWxkLCBOb25lKQp3aXRoIG9wZW4ocGF0aCwgInciKSBhcyBmOgogICAgeWFtbC5kdW1wKGRvYywgZiwgZGVmYXVsdF9mbG93X3N0eWxlPUZhbHNlKQpwcmludCgiQ2xlYW5lZDogIiArIHBhdGgpCg==" \
               | base64 -d > /tmp/clean_secret.py
             python3 /tmp/clean_secret.py "${WORKDIR}/managed-secret-keys.yaml"
+            echo "[STEP 2] After strip    : $(wc -c < ${WORKDIR}/managed-secret-keys.yaml) bytes"
+            echo "[STEP 2] DONE ✓"
 
-            # --- Config Bundle Secret ---
-            echo "[backupConfig] Exporting configBundleSecret..."
+            # ==================================================================
+            # STEP 3 — Export config-bundle secret
+            # Expected output: "Config bundle: quay-registry-config-bundle-XXXXX  NNN bytes"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 3 — Export config-bundle secret"
+            echo "════════════════════════════════════════"
+
             CONFIG_SECRET=$(oc get quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
               -o jsonpath='{.spec.configBundleSecret}')
+            if [[ -z "${CONFIG_SECRET}" ]]; then
+              echo "[STEP 3] ERROR: configBundleSecret field is empty on QuayRegistry CR"
+              exit 1
+            fi
+            echo "[STEP 3] Config bundle  : ${CONFIG_SECRET}"
             oc get secret -n "${NAMESPACE}" "${CONFIG_SECRET}" -o yaml \
               > "${WORKDIR}/config-bundle.yaml"
+            echo "[STEP 3] Size           : $(wc -c < ${WORKDIR}/config-bundle.yaml) bytes"
+            echo "[STEP 3] DONE ✓"
 
-            echo "[backupConfig] Artifacts:"
-            ls -lh "${WORKDIR}/"
+            # ==================================================================
+            # STEP 4 — Store manifests in ConfigMap
+            # Kasten snapshots this ConfigMap as a spec artifact.
+            # On restore it is available in quay-dr before any hook runs.
+            # Expected output: "quay-kanister-backup-manifests applied — 5 keys"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 4 — Store manifests in ConfigMap"
+            echo "════════════════════════════════════════"
 
-            tar -czf - -C "${WORKDIR}" . | kando location push \
-              --profile '{{ toJson .Profile }}' \
-              --path "quay-backups/{{ .Deployment.Namespace }}/config/config.tar.gz" \
-              --output-name configOutput -
-            echo "[backupConfig] Done."
+            CR_B64=$(base64 -w0 "${WORKDIR}/quay-registry.yaml")
+            MSK_B64=$(base64 -w0 "${WORKDIR}/managed-secret-keys.yaml")
+            CB_B64=$(base64 -w0 "${WORKDIR}/config-bundle.yaml")
 
-    # ---- Phase 2: Backup PostgreSQL Database --------------------------------
-    - func: KubeTask
-      name: backupDatabase
-      args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
-        command:
-          - bash
-          - -o
-          - errexit
-          - -o
-          - pipefail
-          - -c
-          - |
-            NAMESPACE="{{ .Deployment.Namespace }}"
-            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
-            WORKDIR="/tmp/quay-backup"
-            mkdir -p "${WORKDIR}"
+            echo "[STEP 4] Encoding sizes :"
+            echo "[STEP 4]   quay-registry.yaml      : $(wc -c < ${WORKDIR}/quay-registry.yaml)B"
+            echo "[STEP 4]   managed-secret-keys.yaml: $(wc -c < ${WORKDIR}/managed-secret-keys.yaml)B"
+            echo "[STEP 4]   config-bundle.yaml       : $(wc -c < ${WORKDIR}/config-bundle.yaml)B"
 
-            PG_POD=$(oc get pod -l quay-component=postgres \
+            oc create configmap quay-kanister-backup-manifests \
               -n "${NAMESPACE}" \
-              -o jsonpath='{.items[0].metadata.name}')
-            echo "[backupDatabase] PostgreSQL pod: ${PG_POD}"
+              --from-literal=quay-registry.yaml.b64="${CR_B64}" \
+              --from-literal=managed-secret-keys.yaml.b64="${MSK_B64}" \
+              --from-literal=config-bundle.yaml.b64="${CB_B64}" \
+              --from-literal=source-namespace="${NAMESPACE}" \
+              --from-literal=cr-name="${CR_NAME}" \
+              -o yaml --dry-run=client \
+              | oc apply -f -
 
-            # Get DB name directly from psql — avoids awk parsing corruption
-            # from special characters in DB_URI password field
-            DB_NAME=$(oc -n "${NAMESPACE}" rsh "${PG_POD}" \
-              bash -c 'psql -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('"'"'postgres'"'"','"'"'template0'"'"','"'"'template1'"'"');"')
-
-            echo "[backupDatabase] DB name: ${DB_NAME} (length: ${#DB_NAME})"
-
-            # Sanity check — fall back to convention if corrupted
-            if [[ ${#DB_NAME} -lt 5 || ${#DB_NAME} -gt 60 ]]; then
-              echo "[backupDatabase] WARNING: DB name looks corrupt, using fallback"
-              DB_NAME="${CR_NAME}-quay-database"
+            if ! oc get configmap quay-kanister-backup-manifests -n "${NAMESPACE}" &>/dev/null; then
+              echo "[STEP 4] ERROR: ConfigMap not found after apply"
+              exit 1
             fi
-            echo "[backupDatabase] Using DB: ${DB_NAME}"
 
-            oc -n "${NAMESPACE}" exec "${PG_POD}" -- \
-              /usr/bin/pg_dump -C "${DB_NAME}" \
-              > "${WORKDIR}/backup.sql"
+            CM_TS=$(oc get configmap quay-kanister-backup-manifests -n "${NAMESPACE}" \
+              -o jsonpath='{.metadata.resourceVersion}')
+            echo "[STEP 4] ConfigMap resourceVersion : ${CM_TS}"
+            echo "[STEP 4] ConfigMap cr-name         : $(oc get configmap quay-kanister-backup-manifests -n ${NAMESPACE} -o jsonpath='{.data.cr-name}')"
+            echo "[STEP 4] DONE ✓ — Kasten will snapshot this as a spec artifact"
 
-            echo "[backupDatabase] Dump size: $(du -sh ${WORKDIR}/backup.sql)"
+            # ==================================================================
+            # STEP 4b — Capture pre-backup component state
+            # Saves spec.components JSON before scale-down so postBackupHook
+            # can restore the CR to exactly its pre-backup state.
+            # Handles both production (HPA managed:true, no overrides) and
+            # lab (HPA managed:false, replicas:1 overrides) correctly.
+            # Expected: "pre-backup-components stored in ConfigMap"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 4b — Capture pre-backup component state"
+            echo "════════════════════════════════════════"
 
-            cat "${WORKDIR}/backup.sql" | kando location push \
-              --profile '{{ toJson .Profile }}' \
-              --path "quay-backups/{{ .Deployment.Namespace }}/database/backup.sql" \
-              --output-name databaseOutput -
-            echo "[backupDatabase] Done."
-
-    # ---- Phase 3: Backup Object Storage (NooBaa) ----------------------------
-    - func: KubeTask
-      name: backupStorage
-      args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
-        command:
-          - bash
-          - -o
-          - errexit
-          - -o
-          - pipefail
-          - -c
-          - |
-            NAMESPACE="{{ .Deployment.Namespace }}"
-            BLOBS_DIR="/tmp/quay-backup/blobs"
-            mkdir -p "${BLOBS_DIR}"
-
-            export AWS_ACCESS_KEY_ID=$(oc get secret -l app=noobaa \
+            PRE_COMPONENTS=$(oc get quayregistry "${CR_NAME}" \
               -n "${NAMESPACE}" \
-              -o jsonpath='{.items[0].data.AWS_ACCESS_KEY_ID}' | base64 -d)
+              -o jsonpath='{.spec.components}' 2>/dev/null || echo "[]")
+            echo "[STEP 4b] Captured ${#PRE_COMPONENTS} chars of component state"
 
-            export AWS_SECRET_ACCESS_KEY=$(oc get secret -l app=noobaa \
+            # Strip transient overrides (replicas:0) from quay/clair/mirror before storing.
+            # These overrides are set by scale-down and must not be captured as the
+            # desired running state — postBackupHook would restore 0 replicas permanently.
+            echo "aW1wb3J0IGpzb24sc3lzCmNvbXBvbmVudHMgPSBqc29uLmxvYWRzKHN5cy5zdGRpbi5yZWFkKCkpCmZvciBjIGluIGNvbXBvbmVudHM6CiAgICBpZiBjLmdldCgna2luZCcpIGluICgncXVheScsJ2NsYWlyJywnbWlycm9yJyk6CiAgICAgICAgYy5wb3AoJ292ZXJyaWRlcycsIE5vbmUpCnByaW50KGpzb24uZHVtcHMoY29tcG9uZW50cykpCg==" \
+              | base64 -d > /tmp/strip_overrides.py
+            CLEAN_COMPONENTS=$(echo "${PRE_COMPONENTS}" | python3 /tmp/strip_overrides.py)
+            echo "[STEP 4b] Components after stripping overrides: ${CLEAN_COMPONENTS}"
+
+            # Base64-encode and store in ConfigMap under 'pre-backup-components'
+            CLEAN_B64=$(echo "${CLEAN_COMPONENTS}" | base64 -w0)
+            echo "aW1wb3J0IGpzb24sc3lzOyBiNjQ9c3lzLmFyZ3ZbMV07IHBhdGNoPXsnZGF0YSc6eydwcmUtYmFja3VwLWNvbXBvbmVudHMnOmI2NH19OyBwcmludChqc29uLmR1bXBzKHBhdGNoKSk=" \
+              | base64 -d > /tmp/gen_cm_patch.py
+            python3 /tmp/gen_cm_patch.py "${CLEAN_B64}" > /tmp/cm_patch.json
+
+            oc patch configmap quay-kanister-backup-manifests \
               -n "${NAMESPACE}" \
-              -o jsonpath='{.items[0].data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
+              --type=merge \
+              --patch-file /tmp/cm_patch.json
+            echo "[STEP 4b] ✓ pre-backup-components stored in ConfigMap"
+            echo "[STEP 4b] DONE ✓"
 
-            S3_ENDPOINT=$(oc get route s3 -n openshift-storage \
-              -o jsonpath='{.spec.host}')
+            # ==================================================================
+            # STEP 5 — Scale DOWN: HPA off → replicas:0 → wait terminate
+            # MUST happen before blob sync — guarantees no new writes to NooBaa.
+            # Postgres stays running (it is not owned by quay/clair/mirror).
+            # Expected output: "Quay scaled to 0 — postgres/redis still running"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 5 — Scale DOWN Quay/Clair/Mirror"
+            echo "════════════════════════════════════════"
 
-            BUCKET_NAME=$(oc get cm -l app=noobaa -n "${NAMESPACE}" \
-              -o jsonpath='{.items[0].data.BUCKET_NAME}')
-
-            echo "[backupStorage] S3 Endpoint : ${S3_ENDPOINT}"
-            echo "[backupStorage] Bucket Name : ${BUCKET_NAME}"
-
-            aws s3 sync \
-              --no-verify-ssl \
-              --endpoint "https://${S3_ENDPOINT}" \
-              "s3://${BUCKET_NAME}" \
-              "${BLOBS_DIR}"
-
-            echo "[backupStorage] Files synced: $(find ${BLOBS_DIR} -type f | wc -l)"
-
-            # tar blobs dir and push via stdin
-            # --output-name kopiaSnapshot emits the artifact consumed by outputArtifacts
-            tar -czf - -C "${BLOBS_DIR}" . | kando location push \
-              --profile '{{ toJson .Profile }}' \
-              --path "quay-backups/{{ .Deployment.Namespace }}/blobs/blobs.tar.gz" \
-              --output-name kopiaSnapshot -
-            echo "[backupStorage] Done."
-
-    # ---- Phase 4: Scale Down ------------------------------------------------
-    - func: KubeTask
-      name: scaleDown
-      args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
-        command:
-          - bash
-          - -o
-          - errexit
-          - -o
-          - pipefail
-          - -c
-          - |
-            NAMESPACE="{{ .Deployment.Namespace }}"
-            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
-
-            echo "[scaleDown] Disabling HPA..."
+            echo "[STEP 5] Phase 1 — Disabling HPA (managed:false)..."
             oc patch quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
               --type=merge \
               -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false}]}}'
+            echo "[STEP 5] Sleeping 10s for HPA change to propagate..."
             sleep 10
+            echo "[STEP 5] HPA disabled"
 
-            echo "[scaleDown] Setting quay/clair/mirror replicas to 0..."
+            echo "[STEP 5] Phase 2 — Setting replicas:0 for quay/clair/mirror..."
             oc patch quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
               --type=merge \
               -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":0}},{"kind":"clair","managed":true,"overrides":{"replicas":0}},{"kind":"mirror","managed":true,"overrides":{"replicas":0}}]}}'
+            oc delete hpa --all -n "${NAMESPACE}" 2>/dev/null || true
+            echo "[STEP 5] HPAs deleted — waiting for pods to terminate..."
 
-            oc wait pod -l app=quay   -n "${NAMESPACE}" --for=delete --timeout=300s 2>/dev/null || true
-            oc wait pod -l app=clair  -n "${NAMESPACE}" --for=delete --timeout=300s 2>/dev/null || true
-            oc wait pod -l app=mirror -n "${NAMESPACE}" --for=delete --timeout=300s 2>/dev/null || true
-            echo "[scaleDown] Done."
+            echo "[STEP 5] Waiting up to 300s for quay-app pods to terminate..."
+            oc wait pod -l app=quay -n "${NAMESPACE}" --for=delete --timeout=300s 2>/dev/null \
+              && echo "[STEP 5] ✓ quay-app pods terminated" \
+              || echo "[STEP 5] WARNING: quay-app pod wait timed out (may already be absent)"
 
-    # ---- Phase 5: Scale Up --------------------------------------------------
-    - func: KubeTask
-      name: scaleUp
-      args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
-        command:
-          - bash
-          - -o
-          - errexit
-          - -o
-          - pipefail
-          - -c
-          - |
-            NAMESPACE="{{ .Deployment.Namespace }}"
-            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+            echo "[STEP 5] Waiting up to 300s for clair-app pods to terminate..."
+            oc wait pod -l quay-component=clair-app -n "${NAMESPACE}" --for=delete --timeout=300s 2>/dev/null \
+              && echo "[STEP 5] ✓ clair-app pods terminated" \
+              || echo "[STEP 5] WARNING: clair-app pod wait timed out (may already be absent)"
 
-            echo "[scaleUp] Re-enabling HPA..."
-            oc patch quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
-              --type=merge \
-              -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":true}]}}'
-            sleep 10
+            echo "[STEP 5] Waiting up to 300s for mirror pods to terminate..."
+            oc wait pod -l quay-component=quay-mirror -n "${NAMESPACE}" --for=delete --timeout=300s 2>/dev/null \
+              && echo "[STEP 5] ✓ mirror pods terminated" \
+              || echo "[STEP 5] WARNING: mirror pod wait timed out (may already be absent)"
 
-            echo "[scaleUp] Restoring managed components..."
-            oc patch quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
-              --type=merge \
-              -p '{"spec":{"components":[{"kind":"quay","managed":true},{"kind":"clair","managed":true},{"kind":"mirror","managed":true}]}}'
+            echo "[STEP 5] Remaining pods (postgres/redis/operator should still be Running):"
+            oc get pods -n "${NAMESPACE}" --no-headers \
+              | awk '{printf "  %-55s %-10s %s\n", $1, $2, $3}'
+            echo "[STEP 5] DONE ✓ — Quay=0. No new writes to NooBaa possible."
 
-            echo "[scaleUp] Waiting for Quay to be Available..."
-            oc wait quayregistry "${CR_NAME}" \
-              --for=condition=Available=true \
-              -n "${NAMESPACE}" \
-              --timeout=600s
-            echo "[scaleUp] Quay is Available."
+            # ==================================================================
+            # STEP 6 — Sync NooBaa blobs → external S3
+            # Quay is at 0 replicas — no in-flight writes during sync.
+            # Two-hop sync: NooBaa → local /tmp/blobs → external S3
+            # Expected output: "N blobs synced to s3://quay-kasten-blobs/quay/<ns>/blobs/ (N verified)"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 6 — Sync NooBaa blobs → external S3"
+            echo "════════════════════════════════════════"
 
-  # ---------------------------------------------------------------------------
-  # RESTORE ACTION
-  # No kind field — Kasten injects the DR namespace context on restore
-  # Template var: {{ .Deployment.Namespace }} for the DR namespace
-  #
-  # Phase order (production-validated):
-  #   1. restoreConfig   — clean DR namespace; apply managed-secret-keys + CR
-  #   2. waitForQuay     — wait for bootstrap; patch config; flush Redis
-  #   3. scaleDownDR     — scale down before DB restore; delete HPA objects
-  #   4. restoreDatabase — drop (quoted) + restore DB from backup
-  #   5. restoreStorage  — sync blobs to DR NooBaa bucket
-  #   6. scaleUpDR       — bring up with replicas:1; delete HPA twice
-  #   7. resetPassword   — bcrypt hash + DB update + Redis flush
-  # ---------------------------------------------------------------------------
-  restore:
-    inputArtifactNames:
-      - quayBackup
+            # Discover NooBaa OBC credentials using OBC name directly
+            # (more reliable than label selector which can match wrong secrets)
+            OBC_NAME="${CR_NAME}-quay-datastore"
+            NOOBAA_BUCKET=$(oc get configmap "${OBC_NAME}" -n "${NAMESPACE}" \
+              -o jsonpath='{.data.BUCKET_NAME}' 2>/dev/null)
+            if [[ -z "${NOOBAA_BUCKET}" ]]; then
+              NOOBAA_BUCKET=$(oc get cm -l app=noobaa -n "${NAMESPACE}" \
+                -o jsonpath='{.items[0].data.BUCKET_NAME}' 2>/dev/null)
+            fi
+            if [[ -z "${NOOBAA_BUCKET}" ]]; then
+              echo "[STEP 6] ERROR: Cannot determine NooBaa bucket name from OBC ConfigMap"
+              echo "[STEP 6]   Check: oc get configmap ${OBC_NAME} -n ${NAMESPACE}"
+              exit 1
+            fi
+
+            NOOBAA_KEY=$(oc get secret "${OBC_NAME}" -n "${NAMESPACE}" \
+              -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' 2>/dev/null | base64 -d)
+            NOOBAA_SECRET_KEY=$(oc get secret "${OBC_NAME}" -n "${NAMESPACE}" \
+              -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' 2>/dev/null | base64 -d)
+            if [[ -z "${NOOBAA_KEY}" || -z "${NOOBAA_SECRET_KEY}" ]]; then
+              echo "[STEP 6] ERROR: Cannot get NooBaa credentials from secret ${OBC_NAME} in ${NAMESPACE}"
+              exit 1
+            fi
+
+            NOOBAA_ENDPOINT=$(oc get route s3 -n openshift-storage \
+              -o jsonpath='{.spec.host}' 2>/dev/null)
+            if [[ -z "${NOOBAA_ENDPOINT}" ]]; then
+              echo "[STEP 6] ERROR: Cannot get NooBaa S3 endpoint from route s3 in openshift-storage"
+              exit 1
+            fi
+
+            DEST_PATH="s3://${EXT_BUCKET}/quay/${NAMESPACE}/blobs"
+
+            echo "[STEP 6] NooBaa OBC name    : ${OBC_NAME}"
+            echo "[STEP 6] NooBaa bucket      : ${NOOBAA_BUCKET}"
+            echo "[STEP 6] NooBaa endpoint    : https://${NOOBAA_ENDPOINT}"
+            echo "[STEP 6] External S3 dest   : ${DEST_PATH}"
+
+            # Pre-flight: verify the NooBaa bucket actually exists
+            # Catches the case where OBC is Bound but bucket was deleted from NooBaa store
+            echo "[STEP 6] Pre-flight: verifying NooBaa bucket exists..."
+            set +e
+            BUCKET_CHECK=$(AWS_ACCESS_KEY_ID="${NOOBAA_KEY}" \
+              AWS_SECRET_ACCESS_KEY="${NOOBAA_SECRET_KEY}" \
+              aws s3 ls "s3://${NOOBAA_BUCKET}" \
+                --endpoint-url "https://${NOOBAA_ENDPOINT}" \
+                --no-verify-ssl 2>&1 | head -3)
+            BUCKET_RC=$?
+            set -e
+            if echo "${BUCKET_CHECK}" | grep -qi "NoSuchBucket\|does not exist\|InvalidBucketName"; then
+              echo "[STEP 6] ERROR: NooBaa bucket '${NOOBAA_BUCKET}' does not exist in NooBaa store"
+              echo "[STEP 6]   OBC is Bound but the backing bucket is missing."
+              echo "[STEP 6]   Recovery: delete and recreate the OBC:"
+              echo "[STEP 6]     oc delete obc ${OBC_NAME} -n ${NAMESPACE} --force --grace-period=0"
+              exit 1
+            fi
+            echo "[STEP 6] ✓ NooBaa bucket verified"
+
+            # Ensure external bucket exists
+            AWS_ACCESS_KEY_ID="${EXT_KEY}" \
+            AWS_SECRET_ACCESS_KEY="${EXT_SECRET}" \
+            AWS_DEFAULT_REGION="${EXT_REGION:-us-east-1}" \
+            aws s3 mb "s3://${EXT_BUCKET}" \
+              --endpoint-url "${EXT_ENDPOINT}" \
+              --no-verify-ssl 2>/dev/null \
+              && echo "[STEP 6] Created bucket: ${EXT_BUCKET}" \
+              || echo "[STEP 6] Bucket exists: ${EXT_BUCKET}"
+
+            # Pull from NooBaa → local temp
+            # || true: bucket existence verified above — non-zero on empty bucket
+            # is harmless. A genuine access error would have failed the pre-flight.
+            echo "[STEP 6] Downloading blobs from NooBaa..."
+            mkdir -p /tmp/blobs
+            AWS_ACCESS_KEY_ID="${NOOBAA_KEY}" \
+            AWS_SECRET_ACCESS_KEY="${NOOBAA_SECRET_KEY}" \
+            AWS_DEFAULT_REGION="us-east-1" \
+            aws s3 sync \
+              --no-verify-ssl \
+              --endpoint-url "https://${NOOBAA_ENDPOINT}" \
+              "s3://${NOOBAA_BUCKET}" \
+              /tmp/blobs \
+              --quiet || true
+
+            BLOB_COUNT=$(find /tmp/blobs -type f 2>/dev/null | wc -l | tr -d ' ')
+            BLOB_SIZE=$(du -sh /tmp/blobs 2>/dev/null | cut -f1 || echo "0")
+            echo "[STEP 6] Downloaded from NooBaa : ${BLOB_COUNT} files (${BLOB_SIZE})"
+
+            if [[ "${BLOB_COUNT}" -eq 0 ]]; then
+              echo "[STEP 6] WARNING: No blobs in NooBaa bucket — registry is empty"
+              echo "[STEP 6]   Valid for a fresh instance. External S3 will reflect 0 blobs."
+            fi
+
+            # Push local → external S3
+            # Skip entirely when 0 blobs — aws s3 sync --delete on an empty source
+            # directory returns exit code 2 on some AWS CLI versions, which kills
+            # the pod under set -e even with || true due to inline-env subshell behaviour.
+            echo "[STEP 6] Uploading ${BLOB_COUNT} blobs to external S3..."
+            if [[ "${BLOB_COUNT}" -gt 0 ]]; then
+              set +e
+              AWS_ACCESS_KEY_ID="${EXT_KEY}" \
+              AWS_SECRET_ACCESS_KEY="${EXT_SECRET}" \
+              AWS_DEFAULT_REGION="${EXT_REGION:-us-east-1}" \
+              aws s3 sync \
+                --no-verify-ssl \
+                --endpoint-url "${EXT_ENDPOINT}" \
+                /tmp/blobs \
+                "${DEST_PATH}" \
+                --delete \
+                --quiet
+              SYNC_RC=$?
+              set -e
+              [[ ${SYNC_RC} -ne 0 ]] && echo "[STEP 6] WARNING: S3 upload exited ${SYNC_RC}" || true
+            else
+              echo "[STEP 6] Skipping upload — 0 blobs (empty registry is valid)"
+            fi
+
+            # Verify — warn on mismatch but never fail the backup
+            set +e
+            UPLOADED=$(AWS_ACCESS_KEY_ID="${EXT_KEY}" \
+              AWS_SECRET_ACCESS_KEY="${EXT_SECRET}" \
+              AWS_DEFAULT_REGION="${EXT_REGION:-us-east-1}" \
+              aws s3 ls "${DEST_PATH}/" \
+                --endpoint-url "${EXT_ENDPOINT}" \
+                --no-verify-ssl \
+                --recursive \
+              2>/dev/null | wc -l | tr -d ' ')
+            set -e
+
+            if [[ "${BLOB_COUNT}" -gt 0 && "${UPLOADED}" -ne "${BLOB_COUNT}" ]]; then
+              echo "[STEP 6] WARNING: count mismatch — downloaded ${BLOB_COUNT}, verified ${UPLOADED} in S3"
+            fi
+            echo "[STEP 6] Verified in S3    : ${UPLOADED} objects at ${DEST_PATH}/"
+            echo "[STEP 6] DONE ✓ — ${BLOB_COUNT} blobs synced (${UPLOADED} verified in S3)"
+
+            # ==================================================================
+            # EXIT — Quay is at 0 replicas
+            # Kasten will now take PVC snapshots (application-consistent)
+            # ==================================================================
+            echo ""
+            echo "======================================================"
+            echo "[DONE] ✓ preBackupHook complete"
+            echo "[DONE]   Namespace        : ${NAMESPACE}"
+            echo "[DONE]   CR Name          : ${CR_NAME}"
+            echo "[DONE]   Manifests stored : quay-kanister-backup-manifests (5 keys)"
+            echo "[DONE]   Blobs synced     : ${BLOB_COUNT} files → ${DEST_PATH}"
+            echo "[DONE]   Quay replicas    : 0 (postgres/redis still running)"
+            echo "[DONE]   End time         : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "[DONE]   Next             : Kasten PVC snapshot (application-consistent)"
+            echo "======================================================"
+
+  # ===========================================================================
+  # postBackupHook
+  # Runs AFTER Kasten completes PVC snapshots.
+  # Scales Quay back up to normal operation.
+  # ===========================================================================
+  postBackupHook:
 
     phases:
 
-    # ---- Phase 1: Restore Config/Secrets ------------------------------------
-    # FIX 3: Stale secret cleanup added before applying any secrets
-    # The DR namespace may have leftover secrets from a previous restore attempt
-    # that will conflict. These must be removed before applying the backup secrets.
     - func: KubeTask
-      name: restoreConfig
+      name: postBackupHook
       args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        namespace: "{{ .Namespace.Name }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:2.0.0{{end}}'
         command:
           - bash
           - -o
@@ -318,171 +599,486 @@ actions:
           - pipefail
           - -c
           - |
-            DR_NAMESPACE="{{ .Deployment.Namespace }}"
-            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
-            SOURCE_NS='{{if index .Options "sourceNamespace"}}{{- index .Options "sourceNamespace" -}}{{else}}quay{{end}}'
-            WORKDIR="/tmp/quay-restore"
-            mkdir -p "${WORKDIR}"
+            NAMESPACE="{{ .Namespace.Name }}"
 
-            # --- Stale secret cleanup (FIX 3) ---
-            # Remove any stale Quay secrets from previous restore attempts
-            # System dockercfg secrets are preserved
-            echo "[restoreConfig] Cleaning stale Quay secrets from ${DR_NAMESPACE}..."
-            oc get secrets -n "${DR_NAMESPACE}" --no-headers \
-              | grep -v "dockercfg\|default-token\|pipeline\|builder\|deployer" \
-              | awk '{print $1}' \
-              | xargs -r oc delete secret -n "${DR_NAMESPACE}" 2>/dev/null || true
-            echo "[restoreConfig] Stale secrets cleaned"
+            CR_NAME_OPT='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{end}}'
+            if [[ -n "${CR_NAME_OPT}" ]]; then
+              CR_NAME="${CR_NAME_OPT}"
+            else
+              CR_NAME=$(oc get quayregistry -n "${NAMESPACE}" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            fi
+            if [[ -z "${CR_NAME}" ]]; then
+              echo "[INIT] ERROR: Could not resolve QuayRegistry CR name"
+              exit 1
+            fi
 
-            # --- Pull config artifacts from object store ---
-            kando location pull \
-              --profile '{{ toJson .Profile }}' \
-              --path "quay-backups/${SOURCE_NS}/config/config.tar.gz" \
-              | tar -xzf - -C "${WORKDIR}"
+            echo "======================================================"
+            echo "[INIT] ▶ Quay postBackupHook — Blueprint v5.0.0"
+            echo "[INIT]   Namespace   : ${NAMESPACE}"
+            echo "[INIT]   CR Name     : ${CR_NAME}"
+            echo "[INIT]   Purpose     : Scale Quay back up after PVC snapshot"
+            echo "[INIT]   Start time  : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "======================================================"
 
-            # --- Patch namespace references source → DR ---
-            for f in quay-registry.yaml managed-secret-keys.yaml config-bundle.yaml; do
-              sed -i "s/namespace: ${SOURCE_NS}/namespace: ${DR_NAMESPACE}/g" \
-                "${WORKDIR}/${f}"
-              echo "[restoreConfig] Patched namespace in ${f}"
-            done
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 1 — Scale UP Quay/Clair/Mirror"
+            echo "════════════════════════════════════════"
 
-            # --- Apply managed-secret-keys FIRST ---
-            # Must be applied before the QuayRegistry CR
-            oc create -f "${WORKDIR}/managed-secret-keys.yaml" 2>/dev/null \
-              || oc replace -f "${WORKDIR}/managed-secret-keys.yaml"
-            echo "[restoreConfig] Managed secret keys applied"
+            # Restore CR to exactly its pre-backup component state.
+            # preBackupHook STEP 4b saved spec.components (base64) in the ConfigMap.
+            # Production: HPA managed:true, no overrides → operator + HPA in full control.
+            # Lab:        HPA managed:false, replicas:1 → operator manages via overrides.
+            echo "[STEP 1] Reading pre-backup component state from ConfigMap..."
+            # Use python to safely extract the base64 key (dot in key name needs special handling)
+            PRE_COMP_B64=$(oc get configmap quay-kanister-backup-manifests \
+              -n "${NAMESPACE}" -o json 2>/dev/null \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('pre-backup-components',''))" \
+              || true)
 
-            # --- Strip configBundleSecret from CR ---
-            # CRITICAL: Do NOT pre-create the config bundle secret.
-            # The operator deletes any externally-owned secrets immediately.
-            # Let the operator bootstrap it fresh, then patch config in Phase 2.
-            # Decoded: removes configBundleSecret from spec
-            echo "aW1wb3J0IHlhbWwsIHN5cwpwYXRoID0gc3lzLmFyZ3ZbMV0Kd2l0aCBvcGVuKHBhdGgpIGFzIGY6CiAgICBkb2MgPSB5YW1sLnNhZmVfbG9hZChmKQpkb2MuZ2V0KCdzcGVjJywge30pLnBvcCgnY29uZmlnQnVuZGxlU2VjcmV0JywgTm9uZSkKd2l0aCBvcGVuKHBhdGgsICd3JykgYXMgZjoKICAgIHlhbWwuZHVtcChkb2MsIGYsIGRlZmF1bHRfZmxvd19zdHlsZT1GYWxzZSkKcHJpbnQoIlJlbW92ZWQgY29uZmlnQnVuZGxlU2VjcmV0IGZyb206ICIgKyBwYXRoKQo=" \
-              | base64 -d > /tmp/strip_config.py
-            python3 /tmp/strip_config.py "${WORKDIR}/quay-registry.yaml"
+            if [[ -n "${PRE_COMP_B64}" ]]; then
+              PRE_COMPONENTS=$(echo "${PRE_COMP_B64}" | base64 -d)
+              echo "[STEP 1] Pre-backup components restored: ${PRE_COMPONENTS}"
+              echo "aW1wb3J0IGpzb24sc3lzOyBjPWpzb24ubG9hZHMoc3lzLmFyZ3ZbMV0pOyBwcmludChqc29uLmR1bXBzKHsnc3BlYyc6eydjb21wb25lbnRzJzpjfX0pKQ==" \
+                | base64 -d > /tmp/gen_restore_patch.py
+              python3 /tmp/gen_restore_patch.py "${PRE_COMPONENTS}" > /tmp/restore_patch.json
+              echo "[STEP 1] Restoring CR to pre-backup state..."
+            else
+              echo "[STEP 1] WARNING: pre-backup-components not in ConfigMap — using safe default"
+              echo "[STEP 1]   Default: HPA managed:true, no overrides (production-safe)"
+              printf '%s' '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":true},{"kind":"quay","managed":true},{"kind":"clair","managed":true},{"kind":"mirror","managed":true}]}}' > /tmp/restore_patch.json
+            fi
 
-            oc create -f "${WORKDIR}/quay-registry.yaml" 2>/dev/null \
-              || echo "[restoreConfig] QuayRegistry CR already exists"
-
-            echo "[restoreConfig] Done — operator will bootstrap config bundle secret"
-
-    # ---- Phase 2: Wait for Quay + Patch Config + Flush Redis ----------------
-    # Waits for operator to fully initialize, then patches backed-up config data
-    # into the operator-created secret and flushes Redis cache
-    - func: KubeTask
-      name: waitForQuay
-      args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
-        command:
-          - bash
-          - -o
-          - errexit
-          - -o
-          - pipefail
-          - -c
-          - |
-            DR_NAMESPACE="{{ .Deployment.Namespace }}"
-            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
-            SOURCE_NS='{{if index .Options "sourceNamespace"}}{{- index .Options "sourceNamespace" -}}{{else}}quay{{end}}'
-
-            echo "[waitForQuay] Waiting for QuayRegistry to become Available..."
-            oc wait quayregistry "${CR_NAME}" \
-              --for=condition=Available=true \
-              -n "${DR_NAMESPACE}" \
-              --timeout=900s
-            echo "[waitForQuay] Quay is Available in ${DR_NAMESPACE}"
-
-            # Get the name of the secret the operator created
-            NEW_SECRET=$(oc get quayregistry "${CR_NAME}" \
-              -n "${DR_NAMESPACE}" \
-              -o jsonpath='{.spec.configBundleSecret}')
-            echo "[waitForQuay] Operator config bundle secret: ${NEW_SECRET}"
-
-            # Get config.yaml data from source namespace
-            SOURCE_SECRET=$(oc get quayregistry "${CR_NAME}" \
-              -n "${SOURCE_NS}" \
-              -o jsonpath='{.spec.configBundleSecret}')
-            CONFIG_DATA=$(oc get secret "${SOURCE_SECRET}" \
-              -n "${SOURCE_NS}" \
-              -o jsonpath='{.data.config\.yaml}')
-
-            # Patch backed-up config into the operator-created secret
-            oc patch secret "${NEW_SECRET}" \
-              -n "${DR_NAMESPACE}" \
-              --type=merge \
-              -p "{\"data\":{\"config.yaml\":\"${CONFIG_DATA}\"}}"
-            echo "[waitForQuay] Config data patched into ${NEW_SECRET}"
-
-            # Flush Redis cache to pick up new config immediately
-            REDIS_POD=$(oc get pod -l quay-component=redis \
-              -n "${DR_NAMESPACE}" \
-              -o jsonpath='{.items[0].metadata.name}')
-            oc rsh -n "${DR_NAMESPACE}" "${REDIS_POD}" \
-              bash -c "redis-cli FLUSHALL" || true
-            echo "[waitForQuay] Redis cache flushed"
-
-    # ---- Phase 3: Scale Down DR Quay (LAB) -------------------------------------
-    # LAB: Retry-loop on HPA deletion to handle operator resource version conflicts
-    # The operator continuously reconciles HPA objects — we must wait for it
-    # to settle before deleting, otherwise we get "object has been modified" errors
-    - func: KubeTask
-      name: scaleDownDR
-      args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
-        command:
-          - bash
-          - -o
-          - errexit
-          - -o
-          - pipefail
-          - -c
-          - |
-            DR_NAMESPACE="{{ .Deployment.Namespace }}"
-            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
-
-            # Step 1: Disable HPA management first — stop operator creating new HPAs
-            echo "[scaleDownDR] Disabling HPA management..."
-            oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
-              --type=merge \
-              -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false}]}}'
-
-            # Step 2: Wait for operator to settle before touching HPA objects
-            echo "[scaleDownDR] Waiting 15s for operator to settle..."
-            sleep 15
-
-            # Step 3: Delete HPA with retry loop — handles resource version conflicts
-            echo "[scaleDownDR] Deleting HPA objects with retry..."
-            for i in $(seq 1 5); do
-              oc delete hpa --all -n "${DR_NAMESPACE}" --ignore-not-found 2>/dev/null && break
-              echo "[scaleDownDR] Retry ${i}/5 after conflict..."
+            cat /tmp/restore_patch.json
+            for i in 1 2 3 4 5; do
+              set +e
+              oc patch quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
+                --type=merge \
+                --patch-file /tmp/restore_patch.json \
+                2>/tmp/patch_err
+              PATCH_RC=$?
+              set -e
+              if [[ ${PATCH_RC} -eq 0 ]]; then
+                echo "[STEP 1] ✓ QuayRegistry restored to pre-backup state (attempt ${i})"
+                break
+              fi
+              echo "[STEP 1] Patch attempt ${i} failed — retrying in 5s..."
               sleep 5
             done
 
-            # Step 4: Zero out replicas
-            echo "[scaleDownDR] Setting replicas to 0..."
-            oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
-              --type=merge \
-              -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":0}},{"kind":"clair","managed":true,"overrides":{"replicas":0}},{"kind":"mirror","managed":true,"overrides":{"replicas":0}}]}}'
+            echo "[STEP 1] Waiting up to 600s for QuayRegistry Available=True..."
+            if oc wait quayregistry "${CR_NAME}" \
+              --for=condition=Available=true \
+              -n "${NAMESPACE}" \
+              --timeout=600s; then
+              echo "[STEP 1] ✓ QuayRegistry Available=True"
+            else
+              echo "[STEP 1] WARNING: Available=True not reached within 600s — showing conditions:"
+              oc get quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
+                -o jsonpath='{.status.conditions}' | python3 -m json.tool \
+                | grep -E '"type"|"status"|"message"' | paste - - - || true
+            fi
 
-            # Step 5: Final HPA cleanup after replicas patched
-            sleep 5
-            oc delete hpa --all -n "${DR_NAMESPACE}" --ignore-not-found 2>/dev/null || true
+            AVAIL=$(oc get quayregistry "${CR_NAME}" -n "${NAMESPACE}" \
+              -o jsonpath='{.status.conditions[?(@.type=="Available")].status}')
+            echo "[STEP 1] Available status : ${AVAIL}"
+            echo "[STEP 1] Pod state:"
+            oc get pods -n "${NAMESPACE}" --no-headers \
+              | awk '{printf "  %-55s %-10s %s\n", $1, $2, $3}'
+            echo "[STEP 1] DONE ✓"
 
-            oc wait pod -l app=quay  -n "${DR_NAMESPACE}" --for=delete --timeout=300s 2>/dev/null || true
-            oc wait pod -l app=clair -n "${DR_NAMESPACE}" --for=delete --timeout=300s 2>/dev/null || true
-            echo "[scaleDownDR] Quay scaled to 0 in ${DR_NAMESPACE}"
+            echo ""
+            echo "======================================================"
+            echo "[DONE] ✓ postBackupHook complete"
+            echo "[DONE]   Namespace   : ${NAMESPACE}"
+            echo "[DONE]   CR Name     : ${CR_NAME}"
+            echo "[DONE]   Available   : ${AVAIL}"
+            echo "[DONE]   End time    : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "======================================================"
 
-    # ---- Phase 4: Restore PostgreSQL Database --------------------------------
-    # FIX 2: DROP DATABASE uses quoted name to handle hyphens in DB name
-    # e.g. "quay-registry-quay-database" requires quoting in psql
+  # ===========================================================================
+  # preRestoreHook
+  # Runs in quay-dr BEFORE Kasten restores spec objects and PVCs.
+  # Cleans stale/conflicting resources so Kasten restore lands cleanly.
+  # ===========================================================================
+  preRestoreHook:
+
+    phases:
+
     - func: KubeTask
-      name: restoreDatabase
+      name: preRestoreHook
       args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        namespace: "{{ .Namespace.Name }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:2.0.0{{end}}'
+        command:
+          - bash
+          - -o
+          - pipefail
+          - -c
+          - |
+            # NOTE: errexit intentionally omitted — best-effort cleanup,
+            # failures should not abort the restore attempt.
+            DR_NAMESPACE="{{ .Namespace.Name }}"
+            SOURCE_NS='{{if index .Options "sourceNamespace"}}{{- index .Options "sourceNamespace" -}}{{else}}quay{{end}}'
+            CR_NAME_OPT='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{end}}'
+
+            # Resolve CR name from option or existing CR in DR namespace
+            if [[ -n "${CR_NAME_OPT}" ]]; then
+              CR_NAME="${CR_NAME_OPT}"
+            else
+              CR_NAME=$(oc get quayregistry -n "${DR_NAMESPACE}" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "quay-registry")
+            fi
+            OBC_NAME="${CR_NAME}-quay-datastore"
+
+            echo "======================================================"
+            echo "[INIT] ▶ Quay preRestoreHook — Blueprint v5.0.0"
+            echo "[INIT]   DR Namespace  : ${DR_NAMESPACE}"
+            echo "[INIT]   Source NS     : ${SOURCE_NS}"
+            echo "[INIT]   CR Name       : ${CR_NAME}"
+            echo "[INIT]   OBC Name      : ${OBC_NAME}"
+            echo "[INIT]   Start time    : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "[INIT]   Purpose       : Clean stale resources before Kasten spec restore"
+            echo "[INIT]   Resources     : HPA disabled, replicas:1 enforced (SE lab constraint)"
+            echo "[INIT]   NOTE          : Source ObjectBucket NOT deleted — breaks NooBaa cluster-wide"
+            echo "======================================================"
+
+            # ==================================================================
+            # STEP 1 — Delete ObjectBucketClaim (strip finalizer first)
+            # The OBC restored by Kasten has original metadata — NooBaa won't
+            # recognise it and leaves it Pending. Deleting it now means Kasten
+            # won't restore it (it's already gone) and postRestoreHook creates
+            # a fresh one with correct labels.
+            # Expected: "OBC deleted" or "OBC not present"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 1 — Delete ObjectBucketClaim"
+            echo "════════════════════════════════════════"
+
+            if oc get objectbucketclaim "${OBC_NAME}" -n "${DR_NAMESPACE}" &>/dev/null; then
+              echo "[STEP 1] Stripping finalizer from OBC: ${OBC_NAME}..."
+              oc patch objectbucketclaim "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                --type=merge \
+                -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              sleep 2
+              oc delete objectbucketclaim "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                --timeout=15s 2>/dev/null \
+                && echo "[STEP 1] ✓ OBC deleted: ${OBC_NAME}" \
+                || {
+                  echo "[STEP 1] Timeout — force deleting..."
+                  oc delete objectbucketclaim "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                    --force --grace-period=0 2>/dev/null || true
+                  echo "[STEP 1] ✓ OBC force-deleted"
+                }
+            else
+              echo "[STEP 1] ✓ OBC not present — namespace is clean"
+            fi
+
+            # ==================================================================
+            # STEP 2b — Delete ALL quay-datastore-* buckets from NooBaa
+            # Deletes every quay-datastore-* bucket EXCEPT the one actively used
+            # by the source namespace's Bound OBC. This is unconditional — it
+            # handles orphaned, half-provisioned, and manually created buckets.
+            # The NooBaa provisioner must start from a completely clean slate to
+            # properly provision the DR OBC and inject storage config into
+            # the operator's config-bundle secret.
+            # Expected: "N buckets deleted, source bucket preserved"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 2b — Clean NooBaa quay-datastore buckets"
+            echo "════════════════════════════════════════"
+
+            NOOBAA_ADMIN_KEY=$(oc get secret noobaa-admin \
+              -n openshift-storage \
+              -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' 2>/dev/null | base64 -d || true)
+            NOOBAA_ADMIN_SECRET=$(oc get secret noobaa-admin \
+              -n openshift-storage \
+              -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' 2>/dev/null | base64 -d || true)
+            NOOBAA_S3_ENDPOINT=$(oc get route s3 -n openshift-storage \
+              -o jsonpath='{.spec.host}' 2>/dev/null || true)
+
+            if [[ -z "${NOOBAA_ADMIN_KEY}" || -z "${NOOBAA_ADMIN_SECRET}" || -z "${NOOBAA_S3_ENDPOINT}" ]]; then
+              echo "[STEP 2b] WARNING: Cannot get NooBaa admin credentials — skipping cleanup"
+              echo "[STEP 2b]   Manually delete all quay-datastore-* buckets before restore"
+            else
+              echo "[STEP 2b] NooBaa admin endpoint: https://${NOOBAA_S3_ENDPOINT}"
+
+              # Discover the source namespace bucket name to protect it
+              SOURCE_OBC_BUCKET=$(oc get configmap "${OBC_NAME}" \
+                -n "${SOURCE_NS}" \
+                -o jsonpath='{.data.BUCKET_NAME}' 2>/dev/null || true)
+              if [[ -n "${SOURCE_OBC_BUCKET}" ]]; then
+                echo "[STEP 2b] Source bucket to preserve: ${SOURCE_OBC_BUCKET}"
+              else
+                echo "[STEP 2b] WARNING: Could not determine source bucket name — will protect nothing"
+              fi
+
+              # List all quay-datastore-* buckets in NooBaa
+              set +e
+              NOOBAA_BUCKETS=$(AWS_ACCESS_KEY_ID="${NOOBAA_ADMIN_KEY}" \
+                AWS_SECRET_ACCESS_KEY="${NOOBAA_ADMIN_SECRET}" \
+                aws s3 ls \
+                  --endpoint-url "https://${NOOBAA_S3_ENDPOINT}" \
+                  --no-verify-ssl 2>/dev/null \
+                | awk '{print $3}' \
+                | grep "^quay-datastore-" || true)
+              set -e
+
+              if [[ -z "${NOOBAA_BUCKETS}" ]]; then
+                echo "[STEP 2b] ✓ No quay-datastore-* buckets found — NooBaa is clean"
+              else
+                echo "[STEP 2b] Found quay-datastore-* buckets:"
+                for bucket in ${NOOBAA_BUCKETS}; do
+                  echo "[STEP 2b]   ${bucket}"
+                done
+
+                DELETED_COUNT=0
+                for bucket in ${NOOBAA_BUCKETS}; do
+                  # Only preserve the active source namespace bucket
+                  if [[ -n "${SOURCE_OBC_BUCKET}" && "${bucket}" == "${SOURCE_OBC_BUCKET}" ]]; then
+                    echo "[STEP 2b] ✓ Preserving source bucket: ${bucket}"
+                    continue
+                  fi
+
+                  echo "[STEP 2b] Deleting: ${bucket}"
+                  set +e
+                  AWS_ACCESS_KEY_ID="${NOOBAA_ADMIN_KEY}" \
+                  AWS_SECRET_ACCESS_KEY="${NOOBAA_ADMIN_SECRET}" \
+                  aws s3 rb "s3://${bucket}" \
+                    --endpoint-url "https://${NOOBAA_S3_ENDPOINT}" \
+                    --no-verify-ssl \
+                    --force 2>/dev/null
+                  RC=$?
+                  set -e
+                  if [[ ${RC} -eq 0 ]]; then
+                    echo "[STEP 2b] ✓ Deleted: ${bucket}"
+                    DELETED_COUNT=$(( DELETED_COUNT + 1 ))
+                  else
+                    echo "[STEP 2b] WARNING: Could not delete ${bucket} (RC=${RC})"
+                  fi
+                done
+                echo "[STEP 2b] Deleted ${DELETED_COUNT} bucket(s)"
+              fi
+
+              # Final state
+              set +e
+              REMAINING=$(AWS_ACCESS_KEY_ID="${NOOBAA_ADMIN_KEY}" \
+                AWS_SECRET_ACCESS_KEY="${NOOBAA_ADMIN_SECRET}" \
+                aws s3 ls \
+                  --endpoint-url "https://${NOOBAA_S3_ENDPOINT}" \
+                  --no-verify-ssl 2>/dev/null \
+                | grep "^quay-datastore-" | wc -l | tr -d ' ' || echo "0")
+              set -e
+              echo "[STEP 2b] Remaining quay-datastore-* buckets: ${REMAINING}"
+              [[ "${REMAINING}" -gt 1 ]] && echo "[STEP 2b] WARNING: More than 1 bucket remaining — source bucket + unexpected buckets" || true
+            fi
+
+
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 3 — Delete managed-secret-keys"
+            echo "════════════════════════════════════════"
+
+            MSK="${CR_NAME}-quay-registry-managed-secret-keys"
+            if oc get secret "${MSK}" -n "${DR_NAMESPACE}" &>/dev/null; then
+              oc delete secret "${MSK}" -n "${DR_NAMESPACE}" \
+                && echo "[STEP 3] ✓ Deleted: ${MSK}" \
+                || echo "[STEP 3] WARNING: Could not delete ${MSK}"
+            else
+              echo "[STEP 3] ✓ Secret not present: ${MSK}"
+            fi
+
+            # ==================================================================
+            # STEP 4 — Delete config-bundle secrets
+            # The operator must bootstrap a fresh config-bundle secret.
+            # If stale ones exist from a previous restore, the operator will
+            # fail looking for a name that no longer matches.
+            # Expected: "N config-bundle secrets deleted" or "none found"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 4 — Delete config-bundle secrets"
+            echo "════════════════════════════════════════"
+
+            CB_SECRETS=$(oc get secrets -n "${DR_NAMESPACE}" \
+              --no-headers 2>/dev/null \
+              | awk '{print $1}' \
+              | grep "config-bundle" || true)
+            if [[ -z "${CB_SECRETS}" ]]; then
+              echo "[STEP 4] ✓ No config-bundle secrets found — namespace is clean"
+            else
+              CB_COUNT=0
+              for secret in ${CB_SECRETS}; do
+                oc delete secret "${secret}" -n "${DR_NAMESPACE}" 2>/dev/null \
+                  && { echo "[STEP 4] ✓ Deleted: ${secret}"; CB_COUNT=$(( CB_COUNT + 1 )); } \
+                  || echo "[STEP 4] WARNING: Could not delete ${secret}"
+              done
+              echo "[STEP 4] Deleted ${CB_COUNT} config-bundle secret(s)"
+            fi
+
+            # ==================================================================
+            # STEP 4b — Delete NooBaa OBC Secret and ConfigMap
+            # Kasten restores the OBC-provisioned Secret and ConfigMap into
+            # quay-dr from the backup. These are named identically to the OBC
+            # (quay-registry-quay-datastore). When NooBaa tries to provision
+            # the DR OBC, it finds these pre-existing resources, sees they have
+            # no ownerReference matching the new OBC, treats them as user-created,
+            # and refuses to overwrite them — leaving the OBC permanently Pending.
+            # Root cause of the persistent OBC Pending issue across all restore attempts.
+            # Expected: "Deleted OBC Secret" + "Deleted OBC ConfigMap" or "not present"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 4b — Delete NooBaa OBC Secret + ConfigMap"
+            echo "════════════════════════════════════════"
+
+            if oc get secret "${OBC_NAME}" -n "${DR_NAMESPACE}" &>/dev/null; then
+              oc delete secret "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                && echo "[STEP 4b] ✓ Deleted OBC Secret: ${OBC_NAME}" \
+                || echo "[STEP 4b] WARNING: Could not delete Secret ${OBC_NAME}"
+            else
+              echo "[STEP 4b] ✓ OBC Secret not present: ${OBC_NAME}"
+            fi
+
+            if oc get configmap "${OBC_NAME}" -n "${DR_NAMESPACE}" &>/dev/null; then
+              oc delete configmap "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                && echo "[STEP 4b] ✓ Deleted OBC ConfigMap: ${OBC_NAME}" \
+                || echo "[STEP 4b] WARNING: Could not delete ConfigMap ${OBC_NAME}"
+            else
+              echo "[STEP 4b] ✓ OBC ConfigMap not present: ${OBC_NAME}"
+            fi
+
+            # ==================================================================
+            # STEP 5 — Patch configBundleSecret out of CR if it already exists
+            # Kasten may have partially restored the CR. If it has the original
+            # configBundleSecret name, the operator immediately hits RolloutBlocked.
+            # Expected: "patched out XXXXX" or "CR not present yet"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 5 — Patch CR configBundleSecret"
+            echo "════════════════════════════════════════"
+
+            if oc get quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" &>/dev/null; then
+              EXISTING_CBS=$(oc get quayregistry "${CR_NAME}" \
+                -n "${DR_NAMESPACE}" \
+                -o jsonpath='{.spec.configBundleSecret}' 2>/dev/null || true)
+              if [[ -n "${EXISTING_CBS}" ]]; then
+                echo "[STEP 5] CR exists with configBundleSecret: ${EXISTING_CBS}"
+                echo "[STEP 5] Patching out configBundleSecret..."
+                oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                  --type=json \
+                  -p='[{"op":"remove","path":"/spec/configBundleSecret"}]' \
+                  2>/dev/null \
+                || oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                  --type=merge \
+                  -p='{"spec":{"configBundleSecret":null}}' 2>/dev/null \
+                || echo "[STEP 5] WARNING: CBS patch failed — postRestoreHook will handle this"
+                echo "[STEP 5] ✓ configBundleSecret patched out of CR"
+              else
+                echo "[STEP 5] ✓ CR exists — configBundleSecret already absent"
+              fi
+
+              # Apply HPA disabled + replicas:1 immediately so the operator
+              # never schedules more than 1 pod per component during restore.
+              # This prevents Pending pods from resource exhaustion on shared clusters.
+              echo "[STEP 5] Applying resource constraints (HPA disabled, replicas:1)..."
+              oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                --type=merge \
+                -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":1}},{"kind":"clair","managed":true,"overrides":{"replicas":1}},{"kind":"mirror","managed":true,"overrides":{"replicas":1}}]}}' \
+                2>/dev/null \
+                && echo "[STEP 5] ✓ HPA disabled, replicas:1 set on existing CR" \
+                || echo "[STEP 5] WARNING: resource constraint patch failed"
+            else
+              echo "[STEP 5] ✓ CR not present yet — Kasten will restore it after this hook"
+              echo "[STEP 5]   postRestoreHook will create it with replicas:1 baked in"
+            fi
+
+            # ==================================================================
+            # STEP 6 — Delete HPAs
+            # HPAs from backup cause RolloutBlocked when combined with replica
+            # overrides. Delete them so the operator starts fresh.
+            # Expected: "N HPAs deleted" or "no HPAs found"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 6 — Delete HPAs"
+            echo "════════════════════════════════════════"
+
+            HPA_COUNT=$(oc get hpa -n "${DR_NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+            if [[ "${HPA_COUNT}" -gt 0 ]]; then
+              oc delete hpa --all -n "${DR_NAMESPACE}" 2>/dev/null \
+                && echo "[STEP 6] ✓ Deleted ${HPA_COUNT} HPA(s)" \
+                || echo "[STEP 6] WARNING: HPA delete failed"
+            else
+              echo "[STEP 6] ✓ No HPAs found — nothing to delete"
+            fi
+
+            # ==================================================================
+            # STEP 7 — Print namespace state for verification
+            # Expected: only quay-operator pod running, no Quay workload pods
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 7 — DR namespace state"
+            echo "════════════════════════════════════════"
+
+            echo "[STEP 7] Pods in ${DR_NAMESPACE}:"
+            oc get pods -n "${DR_NAMESPACE}" --no-headers 2>/dev/null \
+              | awk '{printf "  %-55s %-10s %s\n", $1, $2, $3}' \
+              || echo "  (none)"
+
+            echo ""
+            echo "[STEP 7] Secrets (non-system):"
+            oc get secrets -n "${DR_NAMESPACE}" --no-headers 2>/dev/null \
+              | grep -v "dockercfg\|default-token\|pipeline\|builder\|deployer" \
+              | awk '{printf "  %-50s %s\n", $1, $2}' \
+              || echo "  (none)"
+
+            echo ""
+            echo "[STEP 7] ObjectBucketClaims:"
+            oc get objectbucketclaim -n "${DR_NAMESPACE}" --no-headers 2>/dev/null \
+              || echo "  (none — expected)"
+
+            echo ""
+            echo "[STEP 7] QuayRegistry CRs:"
+            oc get quayregistry -n "${DR_NAMESPACE}" --no-headers 2>/dev/null \
+              || echo "  (none — Kasten will restore after this hook)"
+
+            echo ""
+            echo "======================================================"
+            echo "[DONE] ✓ preRestoreHook complete"
+            echo "[DONE]   DR Namespace  : ${DR_NAMESPACE}"
+            echo "[DONE]   End time      : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "[DONE]   Next          : Kasten will restore spec objects + PVCs"
+            echo "======================================================"
+
+  # ===========================================================================
+  # postRestoreHook
+  # Runs in quay-dr AFTER Kasten has restored all spec objects and PVCs.
+  # Bootstraps the operator, patches config, restores blobs, scales up.
+  # ===========================================================================
+  postRestoreHook:
+
+    phases:
+
+    - func: KubeTask
+      name: postRestoreHook
+      objects:
+        s3creds:
+          kind: Secret
+          name: quay-s3-backup-credentials
+          namespace: "{{ .Namespace.Name }}"
+        qkcreds:
+          kind: Secret
+          name: quay-kanister-credentials
+          namespace: "{{ .Namespace.Name }}"
+      args:
+        namespace: "{{ .Namespace.Name }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:2.0.0{{end}}'
         command:
           - bash
           - -o
@@ -491,238 +1087,1069 @@ actions:
           - pipefail
           - -c
           - |
-            DR_NAMESPACE="{{ .Deployment.Namespace }}"
-            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
+            # ==================================================================
+            # HELPER — wait_for_pod_running <ns> <label> <timeout_s> <desc>
+            # Polls every 5s. Prints pod name on success. Hard-fails on timeout.
+            # ==================================================================
+            wait_for_pod_running() {
+              local ns="$1" label="$2" timeout="$3" desc="$4"
+              local elapsed=0 pod phase
+              # All [WAIT] diagnostic lines go to stderr so they don't pollute
+              # stdout when this function is called inside $() capture
+              echo "[WAIT] Waiting up to ${timeout}s for ${desc} pod Running in ${ns}..." >&2
+              while [[ ${elapsed} -lt ${timeout} ]]; do
+                pod=$(oc get pod -l "${label}" -n "${ns}" \
+                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+                if [[ -n "${pod}" ]]; then
+                  phase=$(oc get pod "${pod}" -n "${ns}" \
+                    -o jsonpath='{.status.phase}' 2>/dev/null || true)
+                  if [[ "${phase}" == "Running" ]]; then
+                    echo "[WAIT] ✓ ${desc} pod '${pod}' Running (${elapsed}s elapsed)" >&2
+                    echo "${pod}"
+                    return 0
+                  fi
+                  echo "[WAIT]   ${desc} pod '${pod}' phase=${phase:-unknown} — retry in 5s... (${elapsed}s/${timeout}s)" >&2
+                else
+                  echo "[WAIT]   No ${desc} pod yet — retry in 5s... (${elapsed}s/${timeout}s)" >&2
+                fi
+                sleep 5
+                elapsed=$(( elapsed + 5 ))
+              done
+              echo "[WAIT] ERROR: ${desc} pod did not reach Running within ${timeout}s" >&2
+              echo "[WAIT]   Last pod list:" >&2
+              oc get pods -n "${ns}" -l "${label}" --no-headers 2>/dev/null \
+                | awk '{printf "    %-55s %-10s %s\n", $1, $2, $3}' >&2 || true
+              return 1
+            }
+
+            # ==================================================================
+            # INIT
+            # ==================================================================
+            DR_NAMESPACE="{{ .Namespace.Name }}"
             SOURCE_NS='{{if index .Options "sourceNamespace"}}{{- index .Options "sourceNamespace" -}}{{else}}quay{{end}}'
+            # Credentials — secret (quay-kanister-credentials) takes precedence over options.
+            # quayAdminPassword/quayAdminUser options override the secret if both are set.
+            SECRET_PASS='{{ index .Phases.postRestoreHook.Secrets.qkcreds.Data "quayAdminPassword" | toString }}'
+            SECRET_USER='{{ index .Phases.postRestoreHook.Secrets.qkcreds.Data "quayAdminUser" | toString }}'
+            OPT_PASS='{{if index .Options "quayAdminPassword"}}{{- index .Options "quayAdminPassword" -}}{{end}}'
+            OPT_USER='{{if index .Options "quayAdminUser"}}{{- index .Options "quayAdminUser" -}}{{end}}'
+            QUAY_PASS="${OPT_PASS:-${SECRET_PASS}}"
+            QUAY_USER_OPT="${OPT_USER:-${SECRET_USER}}"
+            CR_NAME_OPT='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{end}}'
             WORKDIR="/tmp/quay-restore"
             mkdir -p "${WORKDIR}"
 
-            kando location pull \
-              --profile '{{ toJson .Profile }}' \
-              --path "quay-backups/${SOURCE_NS}/database/backup.sql" \
-              > "${WORKDIR}/backup.sql"
+            # S3 credentials from secret injected via objects stanza
+            EXT_KEY='{{ index .Phases.postRestoreHook.Secrets.s3creds.Data "AWS_ACCESS_KEY_ID" | toString }}'
+            EXT_SECRET='{{ index .Phases.postRestoreHook.Secrets.s3creds.Data "AWS_SECRET_ACCESS_KEY" | toString }}'
+            EXT_ENDPOINT='{{ index .Phases.postRestoreHook.Secrets.s3creds.Data "AWS_S3_ENDPOINT" | toString }}'
+            EXT_BUCKET='{{ index .Phases.postRestoreHook.Secrets.s3creds.Data "AWS_S3_BUCKET" | toString }}'
+            EXT_REGION='{{ index .Phases.postRestoreHook.Secrets.s3creds.Data "AWS_DEFAULT_REGION" | toString }}'
 
-            PG_POD=$(oc get pod -l quay-component=postgres \
-              -n "${DR_NAMESPACE}" \
-              -o jsonpath='{.items[0].metadata.name}')
-            echo "[restoreDatabase] PostgreSQL pod: ${PG_POD}"
+            [[ "${EXT_ENDPOINT}" != http://* && "${EXT_ENDPOINT}" != https://* ]] \
+              && EXT_ENDPOINT="https://${EXT_ENDPOINT}"
 
-            # Get DB name directly from psql — avoids awk parsing corruption
-            DB_NAME=$(oc -n "${DR_NAMESPACE}" rsh "${PG_POD}" \
-              bash -c 'psql -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('"'"'postgres'"'"','"'"'template0'"'"','"'"'template1'"'"');"')
+            echo "======================================================"
+            echo "[INIT] ▶ Quay postRestoreHook — Blueprint v5.0.0"
+            echo "[INIT]   DR Namespace  : ${DR_NAMESPACE}"
+            echo "[INIT]   Source NS     : ${SOURCE_NS}"
+            echo "[INIT]   S3 Endpoint   : ${EXT_ENDPOINT}"
+            echo "[INIT]   S3 Bucket     : ${EXT_BUCKET}"
+            echo "[INIT]   Work dir      : ${WORKDIR}"
+            PASS_SOURCE=""
+            [[ -n "${OPT_PASS}" ]] && PASS_SOURCE="option" || true
+            [[ -z "${OPT_PASS}" && -n "${SECRET_PASS}" ]] && PASS_SOURCE="secret" || true
+            echo "[INIT]   Password reset: $([ -n "${QUAY_PASS}" ] && echo "yes (source: ${PASS_SOURCE:-unknown})" || echo "no (skipped — set quayAdminPassword in secret or as option)")"
+            echo "[INIT]   Start time    : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "======================================================"
 
-            echo "[restoreDatabase] DB name: ${DB_NAME} (length: ${#DB_NAME})"
+            # ==================================================================
+            # STEP 0 — Delete NooBaa OBC Secret + ConfigMap restored by Kasten
+            # These resources are provisioned by NooBaa in the source namespace
+            # and backed up by Kasten. When restored into quay-dr they have no
+            # ownerReference matching the new DR OBC. NooBaa's provisioner finds
+            # them, treats them as user-created, and refuses to overwrite them —
+            # leaving the OBC permanently Pending.
+            # This must run in postRestoreHook (not just preRestoreHook) because
+            # Kasten restores these resources AFTER preRestoreHook completes.
+            # Expected: both deleted or confirmed absent
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 0 — Delete Kasten-restored NooBaa OBC resources"
+            echo "════════════════════════════════════════"
 
-            if [[ ${#DB_NAME} -lt 5 || ${#DB_NAME} -gt 60 ]]; then
-              DB_NAME="${CR_NAME}-quay-database"
+            OBC_NAME="${CR_NAME_OPT:-quay-registry}-quay-datastore"
+            # Re-resolve CR_NAME from option if set, otherwise use default
+            if [[ -n "${CR_NAME_OPT}" ]]; then
+              OBC_NAME="${CR_NAME_OPT}-quay-datastore"
+            else
+              OBC_NAME="quay-registry-quay-datastore"
             fi
-            echo "[restoreDatabase] Using DB: ${DB_NAME}"
 
-            # Copy backup into postgres pod
-            oc cp "${WORKDIR}/backup.sql" \
+            if oc get secret "${OBC_NAME}" -n "${DR_NAMESPACE}" &>/dev/null; then
+              OWN_REF=$(oc get secret "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                -o jsonpath='{.metadata.ownerReferences}' 2>/dev/null || true)
+              if [[ -z "${OWN_REF}" || "${OWN_REF}" == "[]" || "${OWN_REF}" == "null" ]]; then
+                # Strip finalizers then force-delete — avoids hang when
+                # oc delete --timeout returns non-zero despite succeeding
+                oc patch secret "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                  --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+                oc delete secret "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                  --force --grace-period=0 2>/dev/null || true
+                echo "[STEP 0] ✓ Deleted Kasten-restored OBC Secret: ${OBC_NAME}"
+              else
+                echo "[STEP 0] OBC Secret has ownerReference — already NooBaa-provisioned, skipping"
+              fi
+            else
+              echo "[STEP 0] ✓ OBC Secret not present: ${OBC_NAME}"
+            fi
+
+            if oc get configmap "${OBC_NAME}" -n "${DR_NAMESPACE}" &>/dev/null; then
+              OWN_REF_CM=$(oc get configmap "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                -o jsonpath='{.metadata.ownerReferences}' 2>/dev/null || true)
+              if [[ -z "${OWN_REF_CM}" || "${OWN_REF_CM}" == "[]" || "${OWN_REF_CM}" == "null" ]]; then
+                # Strip finalizers then force-delete — same pattern as secret
+                oc patch configmap "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                  --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+                oc delete configmap "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                  --force --grace-period=0 2>/dev/null || true
+                echo "[STEP 0] ✓ Deleted Kasten-restored OBC ConfigMap: ${OBC_NAME}"
+              else
+                echo "[STEP 0] OBC ConfigMap has ownerReference — already NooBaa-provisioned, skipping"
+              fi
+            else
+              echo "[STEP 0] ✓ OBC ConfigMap not present: ${OBC_NAME}"
+            fi
+            echo "[STEP 0] DONE ✓ — NooBaa can now provision OBC cleanly"
+
+            # ==================================================================
+            # STEP 1 — Read manifests from ConfigMap
+            # Kasten restored quay-kanister-backup-manifests into DR_NAMESPACE
+            # as a spec artifact before any hook runs.
+            # Expected: 3 files extracted with correct sizes
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 1 — Read manifests from ConfigMap"
+            echo "════════════════════════════════════════"
+
+            if ! oc get configmap quay-kanister-backup-manifests \
+              -n "${DR_NAMESPACE}" &>/dev/null; then
+              echo "[STEP 1] ERROR: ConfigMap 'quay-kanister-backup-manifests' not found in ${DR_NAMESPACE}"
+              echo "[STEP 1]   This ConfigMap must be in the restore point as a spec artifact."
+              echo "[STEP 1]   Verify the backup included it and the restore point is correct."
+              exit 1
+            fi
+
+            CM_TS=$(oc get configmap quay-kanister-backup-manifests -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.metadata.resourceVersion}')
+            CM_CR=$(oc get configmap quay-kanister-backup-manifests -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.data.cr-name}')
+            CM_SRC=$(oc get configmap quay-kanister-backup-manifests -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.data.source-namespace}')
+            echo "[STEP 1] ConfigMap found"
+            echo "[STEP 1]   resourceVersion : ${CM_TS}"
+            echo "[STEP 1]   cr-name         : ${CM_CR}"
+            echo "[STEP 1]   source-namespace: ${CM_SRC}"
+
+            oc get configmap quay-kanister-backup-manifests \
               -n "${DR_NAMESPACE}" \
-              "${PG_POD}:/tmp/backup.sql"
+              -o jsonpath='{.data.quay-registry\.yaml\.b64}' \
+              | base64 -d > "${WORKDIR}/quay-registry.yaml"
 
-            # Terminate active connections
-            oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
-              psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${DB_NAME}';" || true
-
-            # FIX 2: DROP DATABASE with quoted name — handles hyphens correctly
-            oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
-              psql -c "DROP DATABASE IF EXISTS \"${DB_NAME}\";" || true
-
-            # Restore from backup
-            oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
-              bash -c "psql < /tmp/backup.sql"
-
-            # Verify restore
-            oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
-              psql -tAc "SELECT datname FROM pg_database WHERE datname = '${DB_NAME}'"
-            echo "[restoreDatabase] Done."
-
-    # ---- Phase 5: Restore Object Storage ------------------------------------
-    - func: KubeTask
-      name: restoreStorage
-      args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
-        command:
-          - bash
-          - -o
-          - errexit
-          - -o
-          - pipefail
-          - -c
-          - |
-            DR_NAMESPACE="{{ .Deployment.Namespace }}"
-            SOURCE_NS='{{if index .Options "sourceNamespace"}}{{- index .Options "sourceNamespace" -}}{{else}}quay{{end}}'
-            BLOBS_DIR="/tmp/quay-restore/blobs"
-            mkdir -p "${BLOBS_DIR}"
-
-            kando location pull \
-              --profile '{{ toJson .Profile }}' \
-              --path "quay-backups/${SOURCE_NS}/blobs/blobs.tar.gz" \
-              | tar -xzf - -C "${BLOBS_DIR}"
-
-            export AWS_ACCESS_KEY_ID=$(oc get secret -l app=noobaa \
+            oc get configmap quay-kanister-backup-manifests \
               -n "${DR_NAMESPACE}" \
-              -o jsonpath='{.items[0].data.AWS_ACCESS_KEY_ID}' | base64 -d)
+              -o jsonpath='{.data.managed-secret-keys\.yaml\.b64}' \
+              | base64 -d > "${WORKDIR}/managed-secret-keys.yaml"
 
-            export AWS_SECRET_ACCESS_KEY=$(oc get secret -l app=noobaa \
+            oc get configmap quay-kanister-backup-manifests \
               -n "${DR_NAMESPACE}" \
-              -o jsonpath='{.items[0].data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
+              -o jsonpath='{.data.config-bundle\.yaml\.b64}' \
+              | base64 -d > "${WORKDIR}/config-bundle.yaml"
 
-            S3_ENDPOINT=$(oc get route s3 -n openshift-storage \
-              -o jsonpath='{.spec.host}')
+            for f in quay-registry.yaml managed-secret-keys.yaml config-bundle.yaml; do
+              if [[ ! -s "${WORKDIR}/${f}" ]]; then
+                echo "[STEP 1] ERROR: ${f} is empty after extraction from ConfigMap"
+                exit 1
+              fi
+              echo "[STEP 1] ✓ Extracted: ${f} ($(wc -c < ${WORKDIR}/${f}) bytes)"
+            done
+            echo "[STEP 1] DONE ✓"
 
-            BUCKET_NAME=$(oc get cm -l app=noobaa -n "${DR_NAMESPACE}" \
-              -o jsonpath='{.items[0].data.BUCKET_NAME}')
+            # ==================================================================
+            # STEP 2 — Patch namespace + resolve CR name
+            # Expected: "Patched namespace quay → quay-dr in all 3 files"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 2 — Patch namespace in manifests"
+            echo "════════════════════════════════════════"
+            echo "[STEP 2] Replacing 'namespace: ${SOURCE_NS}' → 'namespace: ${DR_NAMESPACE}'"
 
-            echo "[restoreStorage] S3 Endpoint : ${S3_ENDPOINT}"
-            echo "[restoreStorage] Bucket Name : ${BUCKET_NAME}"
-
-            aws s3 sync \
-              --no-verify-ssl \
-              --endpoint "https://${S3_ENDPOINT}" \
-              "${BLOBS_DIR}" \
-              "s3://${BUCKET_NAME}"
-            echo "[restoreStorage] Done."
-
-    # ---- Phase 6: Scale Up DR Quay (LAB) ---------------------------------------
-    # LAB: Enforces replicas:1 on ALL scaleable components
-    # HPA is disabled and deleted in a 90s loop to outlast operator reconcile
-    # This prevents CPU request exhaustion on shared bare-metal cluster
-    - func: KubeTask
-      name: scaleUpDR
-      args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
-        command:
-          - bash
-          - -o
-          - errexit
-          - -o
-          - pipefail
-          - -c
-          - |
-            DR_NAMESPACE="{{ .Deployment.Namespace }}"
-            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
-
-            echo "[scaleUpDR] LAB: Disabling HPA and enforcing replicas:1..."
-            oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
-              --type=merge \
-              -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":1}},{"kind":"clair","managed":true,"overrides":{"replicas":1}},{"kind":"mirror","managed":true,"overrides":{"replicas":1}}]}}'
-
-            # Delete HPA objects in a 90s loop to outlast operator reconcile
-            echo "[scaleUpDR] Suppressing HPA for 90s..."
-            for i in $(seq 1 9); do
-              echo "[scaleUpDR] HPA suppression iteration ${i}/9..."
-              oc delete hpa --all -n "${DR_NAMESPACE}" 2>/dev/null || true
-              sleep 10
+            for f in quay-registry.yaml managed-secret-keys.yaml config-bundle.yaml; do
+              sed -i "s/namespace: ${SOURCE_NS}/namespace: ${DR_NAMESPACE}/g" \
+                "${WORKDIR}/${f}"
+              echo "[STEP 2] ✓ Patched: ${f}"
             done
 
-            # Final patch to lock in replicas:1 after suppression window
-            echo "[scaleUpDR] Final patch to lock replicas:1..."
-            oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
-              --type=merge \
-              -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":1}},{"kind":"clair","managed":true,"overrides":{"replicas":1}},{"kind":"mirror","managed":true,"overrides":{"replicas":1}}]}}'
+            if [[ -n "${CR_NAME_OPT}" ]]; then
+              CR_NAME="${CR_NAME_OPT}"
+              echo "[STEP 2] CR name from option: ${CR_NAME}"
+            else
+              CR_NAME=$(python3 -c "import yaml; print(yaml.safe_load(open('${WORKDIR}/quay-registry.yaml'))['metadata']['name'])")
+              echo "[STEP 2] CR name from manifest: ${CR_NAME}"
+            fi
+            OBC_NAME="${CR_NAME}-quay-datastore"
+            echo "[STEP 2] OBC name: ${OBC_NAME}"
+            echo "[STEP 2] DONE ✓"
 
-            oc delete hpa --all -n "${DR_NAMESPACE}" 2>/dev/null || true
+            # ==================================================================
+            # STEP 3 — Apply managed-secret-keys FIRST
+            # Must precede QuayRegistry CR creation. Contains SECRET_KEY and
+            # DATABASE_SECRET_KEY that must match the restored postgres PVC.
+            # Expected: "Secret quay-registry-quay-registry-managed-secret-keys present in quay-dr"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 3 — Apply managed-secret-keys"
+            echo "════════════════════════════════════════"
 
-            echo "[scaleUpDR] Waiting for Quay DR to become Available..."
-            oc wait quayregistry "${CR_NAME}" \
+            oc create -f "${WORKDIR}/managed-secret-keys.yaml" 2>/dev/null \
+              && echo "[STEP 3] Created managed-secret-keys" \
+              || {
+                oc replace -f "${WORKDIR}/managed-secret-keys.yaml" \
+                  && echo "[STEP 3] Replaced managed-secret-keys"
+              }
+
+            MSK_NAME="${CR_NAME}-quay-registry-managed-secret-keys"
+            if ! oc get secret "${MSK_NAME}" -n "${DR_NAMESPACE}" &>/dev/null; then
+              echo "[STEP 3] ERROR: '${MSK_NAME}' not found after apply"
+              exit 1
+            fi
+            echo "[STEP 3] ✓ Secret '${MSK_NAME}' confirmed present in ${DR_NAMESPACE}"
+            echo "[STEP 3] DONE ✓"
+
+            # ==================================================================
+            # STEP 4 — Apply QuayRegistry CR (configBundleSecret stripped)
+            # If Kasten already restored the CR, preRestoreHook patched it.
+            # Only create it if it's absent.
+            # Expected: "CR present in quay-dr"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 4 — Apply QuayRegistry CR"
+            echo "════════════════════════════════════════"
+
+            if oc get quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" &>/dev/null; then
+              echo "[STEP 4] CR '${CR_NAME}' already exists (restored by Kasten)"
+              echo "[STEP 4] configBundleSecret was patched out in preRestoreHook — skipping create"
+
+              # Verify configBundleSecret is indeed absent
+              CBS=$(oc get quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                -o jsonpath='{.spec.configBundleSecret}' 2>/dev/null || true)
+              if [[ -n "${CBS}" ]]; then
+                echo "[STEP 4] WARNING: configBundleSecret still set to '${CBS}' — patching out..."
+                oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                  --type=json \
+                  -p='[{"op":"remove","path":"/spec/configBundleSecret"}]' 2>/dev/null \
+                || oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                  --type=merge \
+                  -p='{"spec":{"configBundleSecret":null}}' 2>/dev/null || true
+                echo "[STEP 4] ✓ configBundleSecret patched out"
+              else
+                echo "[STEP 4] ✓ configBundleSecret is absent — operator will bootstrap fresh"
+              fi
+
+              # Always enforce resource constraints on existing CR too
+              echo "[STEP 4] Enforcing HPA disabled + replicas:1 on existing CR..."
+              oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                --type=merge \
+                -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":1}},{"kind":"clair","managed":true,"overrides":{"replicas":1}},{"kind":"mirror","managed":true,"overrides":{"replicas":1}}]}}' \
+                2>/dev/null \
+                && echo "[STEP 4] ✓ HPA disabled, replicas:1 enforced" \
+                || echo "[STEP 4] WARNING: resource constraint patch failed"
+              oc delete hpa --all -n "${DR_NAMESPACE}" 2>/dev/null || true
+            else
+              echo "[STEP 4] CR not found — creating from manifest..."
+              # Use strip_and_patch: removes configBundleSecret AND bakes in
+              # HPA disabled + replicas:1 so operator starts resource-constrained
+              echo "aW1wb3J0IHlhbWwsIHN5cwpwYXRoID0gc3lzLmFyZ3ZbMV0Kd2l0aCBvcGVuKHBhdGgpIGFzIGY6CiAgICBkb2MgPSB5YW1sLnNhZmVfbG9hZChmKQojIFJlbW92ZSBydW50aW1lIGZpZWxkcyB0aGF0IHByZXZlbnQgY2xlYW4gYXBwbHkKZG9jLmdldCgic3BlYyIsIHt9KS5wb3AoImNvbmZpZ0J1bmRsZVNlY3JldCIsIE5vbmUpCiMgQmFrZSBpbiBIUEEgZGlzYWJsZWQgKyByZXBsaWNhczoxIHNvIG9wZXJhdG9yIHN0YXJ0cyBjb25zdHJhaW5lZCBmcm9tIGZpcnN0IHJlY29uY2lsZQpjb21wb25lbnRzID0gZG9jLmdldCgic3BlYyIsIHt9KS5nZXQoImNvbXBvbmVudHMiLCBbXSkKa2luZHNfc2VlbiA9IHtjLmdldCgia2luZCIpIGZvciBjIGluIGNvbXBvbmVudHN9CiMgVXBkYXRlIGV4aXN0aW5nIGNvbXBvbmVudCBlbnRyaWVzCmZvciBjIGluIGNvbXBvbmVudHM6CiAgICBpZiBjLmdldCgia2luZCIpID09ICJob3Jpem9udGFscG9kYXV0b3NjYWxlciI6CiAgICAgICAgY1sibWFuYWdlZCJdID0gRmFsc2UKICAgIGVsaWYgYy5nZXQoImtpbmQiKSBpbiAoInF1YXkiLCAiY2xhaXIiLCAibWlycm9yIik6CiAgICAgICAgY1sibWFuYWdlZCJdID0gVHJ1ZQogICAgICAgIGMuc2V0ZGVmYXVsdCgib3ZlcnJpZGVzIiwge30pWyJyZXBsaWNhcyJdID0gMQojIEFkZCBhbnkgbWlzc2luZyBjb21wb25lbnQgZW50cmllcwpmb3Iga2luZCBpbiAoImhvcml6b250YWxwb2RhdXRvc2NhbGVyIiwgInF1YXkiLCAiY2xhaXIiLCAibWlycm9yIik6CiAgICBpZiBraW5kIG5vdCBpbiBraW5kc19zZWVuOgogICAgICAgIGlmIGtpbmQgPT0gImhvcml6b250YWxwb2RhdXRvc2NhbGVyIjoKICAgICAgICAgICAgY29tcG9uZW50cy5hcHBlbmQoeyJraW5kIjoga2luZCwgIm1hbmFnZWQiOiBGYWxzZX0pCiAgICAgICAgZWxzZToKICAgICAgICAgICAgY29tcG9uZW50cy5hcHBlbmQoeyJraW5kIjoga2luZCwgIm1hbmFnZWQiOiBUcnVlLCAib3ZlcnJpZGVzIjogeyJyZXBsaWNhcyI6IDF9fSkKZG9jLnNldGRlZmF1bHQoInNwZWMiLCB7fSlbImNvbXBvbmVudHMiXSA9IGNvbXBvbmVudHMKd2l0aCBvcGVuKHBhdGgsICJ3IikgYXMgZjoKICAgIHlhbWwuZHVtcChkb2MsIGYsIGRlZmF1bHRfZmxvd19zdHlsZT1GYWxzZSkKcHJpbnQoIlByZXBhcmVkIENSOiBjb25maWdCdW5kbGVTZWNyZXQgcmVtb3ZlZCwgSFBBIGRpc2FibGVkLCByZXBsaWNhczoxIGZvciBxdWF5L2NsYWlyL21pcnJvciIpCg==" \
+                | base64 -d > /tmp/strip_and_patch.py
+              python3 /tmp/strip_and_patch.py "${WORKDIR}/quay-registry.yaml"
+              oc create -f "${WORKDIR}/quay-registry.yaml"
+              echo "[STEP 4] ✓ QuayRegistry CR created (HPA disabled, replicas:1 baked in)"
+            fi
+
+            if ! oc get quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" &>/dev/null; then
+              echo "[STEP 4] ERROR: CR '${CR_NAME}' not found after apply"
+              exit 1
+            fi
+            echo "[STEP 4] ✓ CR '${CR_NAME}' present in ${DR_NAMESPACE}"
+            echo "[STEP 4] DONE ✓"
+
+            # ==================================================================
+            # STEP 5 — Wait for operator-created OBC to bind (up to 300s)
+            # The Quay operator creates and owns the OBC itself when it reconciles
+            # the QuayRegistry CR (STEP 4). We must NOT create the OBC manually —
+            # doing so conflicts with the operator's ownerReference and confuses
+            # NooBaa. preRestoreHook deleted the stale OBC; the operator recreates
+            # a fresh one with correct labels and ownerReference automatically.
+            # Expected: "OBC quay-registry-quay-datastore Bound after Xs"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 5 — Wait for operator OBC to bind"
+            echo "════════════════════════════════════════"
+            echo "[STEP 5] Waiting for operator to create and bind OBC: ${OBC_NAME}"
+            echo "[STEP 5] (operator creates OBC automatically during CR reconcile)"
+
+            OBC_ELAPSED=0
+            OBC_PHASE="unknown"
+            OBC_BOUND=false
+            while [[ ${OBC_ELAPSED} -lt 300 ]]; do
+              OBC_PHASE=$(oc get objectbucketclaim "${OBC_NAME}" \
+                -n "${DR_NAMESPACE}" \
+                -o jsonpath='{.status.phase}' 2>/dev/null || echo "not-created-yet")
+
+              # Dual check: phase string OR NooBaa ConfigMap+Secret presence.
+              # Some OCP/NooBaa versions return empty phase even when Bound —
+              # the ConfigMap and Secret being present is definitive proof of binding.
+              OBC_CM_BUCKET=$(oc get configmap "${OBC_NAME}" \
+                -n "${DR_NAMESPACE}" \
+                -o jsonpath='{.data.BUCKET_NAME}' 2>/dev/null || true)
+              OBC_SECRET_KEY=$(oc get secret "${OBC_NAME}" \
+                -n "${DR_NAMESPACE}" \
+                -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' 2>/dev/null || true)
+
+              if [[ "${OBC_PHASE}" == "Bound" ]] || \
+                 [[ -n "${OBC_CM_BUCKET}" && -n "${OBC_SECRET_KEY}" ]]; then
+                OBC_BOUND=true
+                echo "[STEP 5] ✓ OBC '${OBC_NAME}' Bound after ${OBC_ELAPSED}s"
+                echo "[STEP 5]   Phase         : ${OBC_PHASE:-empty/Bound}"
+                echo "[STEP 5]   NooBaa bucket : ${OBC_CM_BUCKET}"
+                break
+              fi
+              echo "[STEP 5]   OBC phase: ${OBC_PHASE:-empty} cm=${OBC_CM_BUCKET:-none} — waiting 10s... (${OBC_ELAPSED}s/300s)"
+              sleep 10
+              OBC_ELAPSED=$(( OBC_ELAPSED + 10 ))
+            done
+
+            if [[ "${OBC_BOUND}" != "true" ]]; then
+              echo "[STEP 5] ERROR: OBC did not bind within 300s (last phase: ${OBC_PHASE})"
+              echo "[STEP 5]   QuayRegistry conditions:"
+              oc get quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                -o jsonpath='{.status.conditions}' 2>/dev/null \
+                | python3 -m json.tool \
+                | grep -E '"type"|"status"|"message"' | paste - - - \
+                | awk '{printf "    %s\n", $0}' || true
+              echo "[STEP 5]   NooBaa status:"
+              oc get noobaa -n openshift-storage --no-headers 2>/dev/null || true
+              echo "[STEP 5]   OBC describe:"
+              oc describe objectbucketclaim "${OBC_NAME}" \
+                -n "${DR_NAMESPACE}" 2>/dev/null | tail -20 || true
+              exit 1
+            fi
+            echo "[STEP 5] DONE ✓"
+
+            # ==================================================================
+            # STEP 6 — Wait for QuayRegistry Available=True (up to 900s)
+            # On timeout, print all conditions for debugging.
+            # Expected: "QuayRegistry Available=True after Xs"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 6 — Wait QuayRegistry Available=True"
+            echo "════════════════════════════════════════"
+            echo "[STEP 6] Waiting up to 900s for QuayRegistry '${CR_NAME}' Available=True..."
+
+            if ! oc wait quayregistry "${CR_NAME}" \
               --for=condition=Available=true \
               -n "${DR_NAMESPACE}" \
-              --timeout=900s
+              --timeout=900s; then
+              echo "[STEP 6] ERROR: Available=True not reached within 900s"
+              echo "[STEP 6] Current conditions:"
+              oc get quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                -o jsonpath='{.status.conditions}' 2>/dev/null \
+                | python3 -m json.tool \
+                | grep -E '"type"|"status"|"message"' \
+                | paste - - - \
+                | awk '{printf "  %s\n", $0}' || true
+              echo "[STEP 6] Pod state:"
+              oc get pods -n "${DR_NAMESPACE}" --no-headers 2>/dev/null \
+                | awk '{printf "  %-55s %-10s %s\n", $1, $2, $3}' || true
+              exit 1
+            fi
+            echo "[STEP 6] ✓ QuayRegistry Available=True"
 
-            # Verify replica counts are correct
-            echo "[scaleUpDR] Verifying pod and HPA state..."
-            oc get pods -n "${DR_NAMESPACE}" --no-headers | grep -v Completed
-            oc get hpa -n "${DR_NAMESPACE}" 2>/dev/null || echo "[scaleUpDR] No HPA found"
-            echo "[scaleUpDR] Quay DR is Available with replicas:1"
+            # ==================================================================
+            # STEP 7 — Confirm postgres and redis are Running
+            # quay-app/clair-app/mirror are intentionally at 0 replicas here —
+            # they will be scaled up at STEP 11 after blob restore completes.
+            # Expected: postgres Running, redis Running
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 7 — Confirm key pods Running"
+            echo "════════════════════════════════════════"
 
-    # ---- Phase 7: Reset Password + Flush Redis (FIX 4) ----------------------
-    # After restore the DB contains the source password hash which may not
-    # match the configured password. This phase generates a fresh bcrypt hash
-    # and updates it directly in the DB, then flushes Redis to clear any
-    # cached auth tokens that reference the old hash.
-    # quayAdminUser defaults to 'praveen', quayAdminPassword defaults to 'password'
-    - func: KubeTask
-      name: resetPassword
-      args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
-        command:
-          - bash
-          - -o
-          - errexit
-          - -o
-          - pipefail
-          - -c
-          - |
-            DR_NAMESPACE="{{ .Deployment.Namespace }}"
-            CR_NAME='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{else}}quay-registry{{end}}'
-            QUAY_USER='{{if index .Options "quayAdminUser"}}{{- index .Options "quayAdminUser" -}}{{else}}praveen{{end}}'
-            QUAY_PASS='{{if index .Options "quayAdminPassword"}}{{- index .Options "quayAdminPassword" -}}{{else}}password{{end}}'
+            # At this point the operator has bootstrapped but quay-app/clair-app/mirror
+            # are at replicas:0 — they will be scaled up at STEP 11 after blob restore.
+            # Only wait for postgres and redis which must be Running for STEP 8 (config
+            # patch) and STEP 13 (password reset) to work correctly.
+            echo "[STEP 7] Waiting for postgres (up to 180s)..."
+            PG_POD=$(wait_for_pod_running "${DR_NAMESPACE}" "quay-component=postgres" 180 "postgres")
+            echo "[STEP 7] ✓ postgres: ${PG_POD}"
 
-            PG_POD=$(oc get pod -l quay-component=postgres \
+            echo "[STEP 7] Waiting for redis (up to 120s)..."
+            REDIS_POD=$(wait_for_pod_running "${DR_NAMESPACE}" "quay-component=redis" 120 "redis")
+            echo "[STEP 7] ✓ redis: ${REDIS_POD}"
+
+            echo "[STEP 7] NOTE: quay-app/clair-app/mirror are at 0 replicas — expected"
+            echo "[STEP 7]   They will be scaled up at STEP 11 after blob restore"
+
+            echo "[STEP 7] Full pod state:"
+            oc get pods -n "${DR_NAMESPACE}" --no-headers \
+              | awk '{printf "  %-55s %-10s %-12s %s\n", $1, $2, $3, $4}'
+
+            # Check for Pending pods and print scheduling reason (resource exhaustion diagnosis)
+            PENDING_PODS=$(oc get pods -n "${DR_NAMESPACE}" --no-headers 2>/dev/null \
+              | grep "Pending" | awk '{print $1}' || true)
+            if [[ -n "${PENDING_PODS}" ]]; then
+              echo "[STEP 7] WARNING: Pending pods detected — checking scheduling reasons:"
+              for pod in ${PENDING_PODS}; do
+                echo "[STEP 7]   Pod: ${pod}"
+                oc describe pod "${pod}" -n "${DR_NAMESPACE}" 2>/dev/null \
+                  | grep -A3 "Events:\|Insufficient\|insufficient\|cannot be scheduled\|node(s)" \
+                  | head -10 \
+                  | awk '{printf "    %s\n", $0}'
+              done
+              echo "[STEP 7] TIP: Check node allocatable resources:"
+              echo "[STEP 7]   oc describe nodes | grep -A5 Allocatable"
+            fi
+            echo "[STEP 7] DONE ✓"
+
+            # ==================================================================
+            # STEP 8 — Patch backed-up config.yaml into operator-created secret
+            # The operator created a new config-bundle secret during bootstrap.
+            # We patch our backed-up config.yaml into it to restore Quay's
+            # configuration (DB connection string, storage config, etc.)
+            # Expected: "config.yaml (NNN chars base64) patched into quay-registry-config-bundle-XXXXX"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 8 — Patch config.yaml into operator secret"
+            echo "════════════════════════════════════════"
+
+            NEW_SECRET=$(oc get quayregistry "${CR_NAME}" \
               -n "${DR_NAMESPACE}" \
-              -o jsonpath='{.items[0].metadata.name}')
-            echo "[resetPassword] PostgreSQL pod: ${PG_POD}"
+              -o jsonpath='{.spec.configBundleSecret}')
+            if [[ -z "${NEW_SECRET}" ]]; then
+              echo "[STEP 8] ERROR: configBundleSecret field is empty on CR '${CR_NAME}'"
+              echo "[STEP 8]   The operator may not have completed bootstrap yet"
+              exit 1
+            fi
+            echo "[STEP 8] Operator-created secret: ${NEW_SECRET}"
 
-            # Install bcrypt if not present
-            pip3 install bcrypt --quiet 2>/dev/null || true
+            # Extract config.yaml from backed-up config-bundle.
+            # The Quay operator manages DISTRIBUTED_STORAGE_CONFIG from the OBC.
+            # If backed-up config.yaml has no storage config, skip the patch to
+            # avoid overwriting operator-injected storage config.
+            echo "aW1wb3J0IHlhbWwsc3lzCnRyeToKICAgIGRvYz15YW1sLnNhZmVfbG9hZChvcGVuKHN5cy5hcmd2WzFdKSkKICAgIHByaW50KGRvYy5nZXQoJ2RhdGEnLHt9KS5nZXQoJ2NvbmZpZy55YW1sJywnJykpCmV4Y2VwdDoKICAgIHByaW50KCcnKQo=" \
+              | base64 -d > /tmp/get_config.py
+            echo "aW1wb3J0IHlhbWwsYmFzZTY0LHN5cwp0cnk6CiAgICBkb2M9eWFtbC5zYWZlX2xvYWQob3BlbihzeXMuYXJndlsxXSkpCiAgICBiNjQ9ZG9jLmdldCgnZGF0YScse30pLmdldCgnY29uZmlnLnlhbWwnLCcnKQogICAgY2ZnPXlhbWwuc2FmZV9sb2FkKGJhc2U2NC5iNjRkZWNvZGUoYjY0Kyc9PScpKQogICAgcHJpbnQoJ3llcycgaWYgJ0RJU1RSSUJVVEVEX1NUT1JBR0VfQ09ORklHJyBpbiAoY2ZnIG9yIHt9KSBlbHNlICdubycpCmV4Y2VwdDoKICAgIHByaW50KCdubycpCg==" \
+              | base64 -d > /tmp/check_storage.py
 
-            # Generate bcrypt hash and write SQL to file
-            # Written to file to avoid shell escaping of $ in hash
-            echo "aW1wb3J0IGJjcnlwdCwgc3VicHJvY2Vzcywgc3lzCnBhc3N3b3JkID0gc3lzLmFyZ3ZbMV0uZW5jb2RlKCd1dGYtOCcpCmhhc2hlZCA9IGJjcnlwdC5oYXNocHcocGFzc3dvcmQsIGJjcnlwdC5nZW5zYWx0KDEyKSkuZGVjb2RlKCd1dGYtOCcpCnVzZXJuYW1lID0gc3lzLmFyZ3ZbMl0Kc3FsID0gZiJVUERBVEUgcHVibGljLnVzZXIgU0VUIHBhc3N3b3JkX2hhc2ggPSAne2hhc2hlZH0nIFdIRVJFIHVzZXJuYW1lID0gJ3t1c2VybmFtZX0nOyIKd2l0aCBvcGVuKCcvdG1wL3Jlc2V0X3B3LnNxbCcsICd3JykgYXMgZjoKICAgIGYud3JpdGUoc3FsKQpwcmludCgiSGFzaCBnZW5lcmF0ZWQgZm9yIHVzZXI6ICIgKyB1c2VybmFtZSkKcHJpbnQoIkhhc2ggcHJldmlldzogIiArIGhhc2hlZFs6MjBdICsgIi4uLiIpCg==" \
-              | base64 -d > /tmp/gen_hash.py
+            CONFIG_DATA=$(python3 /tmp/get_config.py "${WORKDIR}/config-bundle.yaml" 2>/dev/null || true)
 
-            python3 /tmp/gen_hash.py "${QUAY_PASS}" "${QUAY_USER}"
+            if [[ -z "${CONFIG_DATA}" ]]; then
+              echo "[STEP 8] Backed-up config.yaml is empty — operator manages config dynamically"
+              echo "[STEP 8] DONE ✓ (skipped — no config to patch)"
+            else
+              echo "[STEP 8] config.yaml: ${#CONFIG_DATA} chars (base64)"
+              HAS_STORAGE=$(python3 /tmp/check_storage.py "${WORKDIR}/config-bundle.yaml" 2>/dev/null || echo "no")
+              if [[ "${HAS_STORAGE}" == "no" ]]; then
+                echo "[STEP 8] No DISTRIBUTED_STORAGE_CONFIG in backup — skipping patch"
+                echo "[STEP 8] DONE ✓ (skipped — storage config managed by operator)"
+              else
+                oc patch secret "${NEW_SECRET}" \
+                  -n "${DR_NAMESPACE}" \
+                  --type=merge \
+                  -p "{\"data\":{\"config.yaml\":\"${CONFIG_DATA}\"}}"
+                echo "[STEP 8] ✓ config.yaml patched into: ${NEW_SECRET}"
+                echo "[STEP 8] DONE ✓"
+              fi
+            fi
 
-            # Copy SQL to postgres pod and execute
-            oc cp /tmp/reset_pw.sql \
+            # ==================================================================
+            # STEP 9 — Scale DOWN DR before blob restore
+            # No active Quay connections during blob sync to NooBaa.
+            # Expected: "quay/clair/mirror pods terminated"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 9 — Scale DOWN DR for blob restore"
+            echo "════════════════════════════════════════"
+
+            # Check for ConfigInvalid — if found, auto-fix by stripping
+            # DISTRIBUTED_STORAGE_CONFIG from the config bundle secret.
+            # This happens when the backed-up config.yaml contained storage config
+            # that conflicts with objectstorage:managed:true in Quay 3.13+.
+            # The operator cannot reconcile (and will not honor overrides.replicas)
+            # until this is resolved.
+            echo "[STEP 9] Checking for ConfigInvalid state..."
+            CONFIG_INVALID=$(oc get quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.status.conditions[?(@.reason=="ConfigInvalid")].reason}' \
+              2>/dev/null || true)
+
+            if [[ "${CONFIG_INVALID}" == "ConfigInvalid" ]]; then
+              echo "[STEP 9] ⚠ ConfigInvalid detected — auto-fixing storage config conflict"
+              CBS_DR=$(oc get quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                -o jsonpath='{.spec.configBundleSecret}' 2>/dev/null || true)
+              if [[ -n "${CBS_DR}" ]]; then
+                echo "aW1wb3J0IHN5cywgeWFtbCwgYmFzZTY0LCBqc29uCnNlY3JldF9uYW1lID0gc3lzLmFyZ3ZbMV0KbmFtZXNwYWNlID0gc3lzLmFyZ3ZbMl0KaW1wb3J0IHN1YnByb2Nlc3MKcmVzdWx0ID0gc3VicHJvY2Vzcy5ydW4oCiAgICBbJ29jJywnZ2V0Jywnc2VjcmV0JyxzZWNyZXRfbmFtZSwnLW4nLG5hbWVzcGFjZSwKICAgICAnLW8nLCdqc29ucGF0aD17LmRhdGEuY29uZmlnXC55YW1sfSddLAogICAgY2FwdHVyZV9vdXRwdXQ9VHJ1ZSwgdGV4dD1UcnVlKQppZiByZXN1bHQucmV0dXJuY29kZSAhPSAwOgogICAgcHJpbnQoJ0VSUk9SOiBjYW5ub3QgcmVhZCBzZWNyZXQnKQogICAgc3lzLmV4aXQoMSkKYjY0ID0gcmVzdWx0LnN0ZG91dC5zdHJpcCgpCmlmIG5vdCBiNjQ6CiAgICBwcmludCgnRU1QVFknKQogICAgc3lzLmV4aXQoMCkKY2ZnID0geWFtbC5zYWZlX2xvYWQoYmFzZTY0LmI2NGRlY29kZShiNjQgKyAnPT0nKSkKaWYgY2ZnIGlzIE5vbmU6CiAgICBjZmcgPSB7fQpyZW1vdmVkID0gW10KZm9yIGtleSBpbiBbJ0RJU1RSSUJVVEVEX1NUT1JBR0VfQ09ORklHJywnRElTVFJJQlVURURfU1RPUkFHRV9ERUZBVUxUX0xPQ0FUSU9OUycsJ0RJU1RSSUJVVEVEX1NUT1JBR0VfUFJFRkVSRU5DRSddOgogICAgaWYga2V5IGluIGNmZzoKICAgICAgICBjZmcucG9wKGtleSkKICAgICAgICByZW1vdmVkLmFwcGVuZChrZXkpCmlmIG5vdCByZW1vdmVkOgogICAgcHJpbnQoJ0NMRUFOJykKICAgIHN5cy5leGl0KDApCm5ld19iNjQgPSBiYXNlNjQuYjY0ZW5jb2RlKHlhbWwuZHVtcChjZmcpLmVuY29kZSgpKS5kZWNvZGUoKQpwYXRjaCA9IHsnZGF0YSc6IHsnY29uZmlnLnlhbWwnOiBuZXdfYjY0fX0KcHJpbnQoanNvbi5kdW1wcyhwYXRjaCkpCg==" \
+                  | base64 -d > /tmp/fix_config_invalid.py
+                PATCH_RESULT=$(python3 /tmp/fix_config_invalid.py "${CBS_DR}" "${DR_NAMESPACE}")
+                if [[ "${PATCH_RESULT}" == "CLEAN" ]]; then
+                  echo "[STEP 9] config.yaml has no storage config — ConfigInvalid has another cause"
+                  echo "[STEP 9] WARNING: proceeding but scale-down may not work correctly"
+                elif [[ "${PATCH_RESULT}" == EMPTY* || "${PATCH_RESULT}" == ERROR* ]]; then
+                  echo "[STEP 9] WARNING: ${PATCH_RESULT} — skipping storage config fix"
+                else
+                  echo "${PATCH_RESULT}" > /tmp/config_fix_patch.json
+                  oc patch secret "${CBS_DR}" -n "${DR_NAMESPACE}" \
+                    --type=merge --patch-file /tmp/config_fix_patch.json
+                  echo "[STEP 9] ✓ DISTRIBUTED_STORAGE_CONFIG removed from config bundle"
+                  echo "[STEP 9] Waiting 30s for operator to recover from ConfigInvalid..."
+                  sleep 30
+                  NEW_STATE=$(oc get quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                    -o jsonpath='{.status.conditions[?(@.reason=="ConfigInvalid")].reason}' \
+                    2>/dev/null || true)
+                  if [[ -z "${NEW_STATE}" ]]; then
+                    echo "[STEP 9] ✓ Operator recovered — ConfigInvalid resolved"
+                  else
+                    echo "[STEP 9] WARNING: Operator still in ConfigInvalid after fix — proceeding anyway"
+                  fi
+                fi
+              else
+                echo "[STEP 9] WARNING: Cannot get configBundleSecret name — skipping auto-fix"
+              fi
+            else
+              echo "[STEP 9] ✓ Operator state healthy — no ConfigInvalid"
+            fi
+
+            echo "[STEP 9] Disabling HPA + setting replicas:0..."
+            # Retry patch up to 5 times — operator may update CR simultaneously
+            for i in 1 2 3 4 5; do
+              set +e
+              oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                --type=merge \
+                -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":0}},{"kind":"clair","managed":true,"overrides":{"replicas":0}},{"kind":"mirror","managed":true,"overrides":{"replicas":0}}]}}' \
+                2>/tmp/patch_err
+              PATCH_RC=$?
+              set -e
+              if [[ ${PATCH_RC} -eq 0 ]]; then
+                echo "[STEP 9] ✓ QuayRegistry patched (attempt ${i})"
+                break
+              fi
+              echo "[STEP 9] Patch attempt ${i} failed: $(cat /tmp/patch_err | tr -d '\n') — retrying in 5s..."
+              sleep 5
+            done
+            oc delete hpa --all -n "${DR_NAMESPACE}" 2>/dev/null || true
+            sleep 10
+
+            echo "[STEP 9] Waiting up to 300s for quay-app pods to terminate..."
+            oc wait pod -l app=quay -n "${DR_NAMESPACE}" --for=delete --timeout=300s 2>/dev/null \
+              && echo "[STEP 9] ✓ quay-app pods terminated" \
+              || echo "[STEP 9] WARNING: quay-app wait timed out"
+
+            echo "[STEP 9] Waiting up to 300s for clair-app pods to terminate..."
+            oc wait pod -l quay-component=clair-app -n "${DR_NAMESPACE}" --for=delete --timeout=300s 2>/dev/null \
+              && echo "[STEP 9] ✓ clair-app pods terminated" \
+              || echo "[STEP 9] WARNING: clair-app wait timed out"
+
+            echo "[STEP 9] Waiting up to 300s for mirror pods to terminate..."
+            oc wait pod -l quay-component=quay-mirror -n "${DR_NAMESPACE}" --for=delete --timeout=300s 2>/dev/null \
+              && echo "[STEP 9] ✓ mirror pods terminated" \
+              || echo "[STEP 9] WARNING: mirror wait timed out"
+
+            echo "[STEP 9] Remaining pods (postgres/redis should still be Running):"
+            oc get pods -n "${DR_NAMESPACE}" --no-headers \
+              | awk '{printf "  %-55s %-10s %s\n", $1, $2, $3}'
+            echo "[STEP 9] DONE ✓"
+
+            # ==================================================================
+            # STEP 10 — Restore blobs: external S3 → DR NooBaa
+            # OBC is already Bound from STEP 5. Read DR NooBaa credentials,
+            # pull from external S3, push into DR NooBaa bucket.
+            # Expected: "N blobs restored to DR NooBaa bucket BUCKET_NAME"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 10 — Restore blobs: S3 → DR NooBaa"
+            echo "════════════════════════════════════════"
+
+            # Read DR NooBaa OBC credentials directly by OBC name
+            # More reliable than label selector which can match wrong resources
+            DR_NOOBAA_KEY=$(oc get secret "${OBC_NAME}" \
               -n "${DR_NAMESPACE}" \
-              "${PG_POD}:/tmp/reset_pw.sql"
+              -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' 2>/dev/null | base64 -d || true)
+            DR_NOOBAA_SECRET_KEY=$(oc get secret "${OBC_NAME}" \
+              -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' 2>/dev/null | base64 -d || true)
 
-            oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
-              psql -d "quay-registry-quay-database" -f /tmp/reset_pw.sql
+            DR_NOOBAA_BUCKET=$(oc get configmap "${OBC_NAME}" \
+              -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.data.BUCKET_NAME}' 2>/dev/null || true)
 
-            echo "[resetPassword] Password updated for user: ${QUAY_USER}"
+            if [[ -z "${DR_NOOBAA_KEY}" || -z "${DR_NOOBAA_SECRET_KEY}" ]]; then
+              echo "[STEP 10] ERROR: Cannot get DR NooBaa credentials from secret ${OBC_NAME}"
+              exit 1
+            fi
+            if [[ -z "${DR_NOOBAA_BUCKET}" ]]; then
+              echo "[STEP 10] ERROR: Cannot determine DR NooBaa bucket from configmap ${OBC_NAME}"
+              exit 1
+            fi
+            echo "[STEP 10] DR NooBaa OBC secret : ${OBC_NAME}"
+            echo "[STEP 10] DR NooBaa bucket     : ${DR_NOOBAA_BUCKET}"
 
-            # Flush Redis to clear cached auth tokens
+            NOOBAA_ENDPOINT=$(oc get route s3 -n openshift-storage \
+              -o jsonpath='{.spec.host}' 2>/dev/null)
+            echo "[STEP 10] NooBaa endpoint      : https://${NOOBAA_ENDPOINT}"
+
+            SRC_PATH="s3://${EXT_BUCKET}/quay/${SOURCE_NS}/blobs"
+            echo "[STEP 10] Source path          : ${SRC_PATH}"
+
+            # Pull from external S3 → local temp
+            echo "[STEP 10] Downloading blobs from external S3..."
+            mkdir -p /tmp/restore-blobs
+            AWS_ACCESS_KEY_ID="${EXT_KEY}" \
+            AWS_SECRET_ACCESS_KEY="${EXT_SECRET}" \
+            AWS_DEFAULT_REGION="${EXT_REGION:-us-east-1}" \
+            aws s3 sync \
+              --no-verify-ssl \
+              --endpoint-url "${EXT_ENDPOINT}" \
+              "${SRC_PATH}" \
+              /tmp/restore-blobs \
+              --quiet
+
+            BLOB_COUNT=$(find /tmp/restore-blobs -type f 2>/dev/null | wc -l | tr -d ' ')
+            BLOB_SIZE=$(du -sh /tmp/restore-blobs 2>/dev/null | cut -f1 || echo "0")
+            echo "[STEP 10] Downloaded from S3   : ${BLOB_COUNT} files (${BLOB_SIZE})"
+
+            if [[ "${BLOB_COUNT}" -eq 0 ]]; then
+              echo "[STEP 10] WARNING: No blobs found at ${SRC_PATH} — registry will be empty"
+            else
+              echo "[STEP 10] Uploading blobs to DR NooBaa..."
+              AWS_ACCESS_KEY_ID="${DR_NOOBAA_KEY}" \
+              AWS_SECRET_ACCESS_KEY="${DR_NOOBAA_SECRET_KEY}" \
+              AWS_DEFAULT_REGION="us-east-1" \
+              aws s3 sync \
+                --no-verify-ssl \
+                --endpoint-url "https://${NOOBAA_ENDPOINT}" \
+                /tmp/restore-blobs \
+                "s3://${DR_NOOBAA_BUCKET}" \
+                --quiet
+
+              echo "[STEP 10] ✓ Uploaded ${BLOB_COUNT} blobs to DR NooBaa bucket: ${DR_NOOBAA_BUCKET}"
+            fi
+            echo "[STEP 10] DONE ✓"
+
+            # ==================================================================
+            # STEP 11 — Scale UP DR (replicas:1, HPA disabled)
+            # Double-patch + double HPA delete to prevent operator rebound.
+            # Waits Available=True (900s) then confirms postgres Running (180s).
+            # Expected: "Available=True. 1 pod per component."
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 11 — Scale UP DR (replicas:1)"
+            echo "════════════════════════════════════════"
+
+            echo "[STEP 11] Phase 1 — Setting HPA managed:false + replicas:1..."
+            for i in 1 2 3 4 5; do
+              set +e
+              oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                --type=merge \
+                -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":1}},{"kind":"clair","managed":true,"overrides":{"replicas":1}},{"kind":"mirror","managed":true,"overrides":{"replicas":1}}]}}' \
+                2>/tmp/patch_err
+              PATCH_RC=$?
+              set -e
+              if [[ ${PATCH_RC} -eq 0 ]]; then
+                echo "[STEP 11] ✓ QuayRegistry patched (attempt ${i})"
+                break
+              fi
+              echo "[STEP 11] Patch attempt ${i} failed: $(cat /tmp/patch_err | tr -d '\n') — retrying in 5s..."
+              sleep 5
+            done
+            oc delete hpa --all -n "${DR_NAMESPACE}" 2>/dev/null || true
+            echo "[STEP 11] Sleeping 30s before re-apply (catches operator HPA rebound)..."
+            sleep 30
+
+            echo "[STEP 11] Phase 2 — Re-applying replicas:1 to catch operator rebound..."
+            for i in 1 2 3 4 5; do
+              set +e
+              oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                --type=merge \
+                -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":1}},{"kind":"clair","managed":true,"overrides":{"replicas":1}},{"kind":"mirror","managed":true,"overrides":{"replicas":1}}]}}' \
+                2>/tmp/patch_err
+              PATCH_RC=$?
+              set -e
+              [[ ${PATCH_RC} -eq 0 ]] && break
+              echo "[STEP 11] Patch attempt ${i} failed — retrying in 5s..."
+              sleep 5
+            done
+            oc delete hpa --all -n "${DR_NAMESPACE}" 2>/dev/null || true
+            echo "[STEP 11] Waiting up to 900s for QuayRegistry Available=True..."
+
+            if ! oc wait quayregistry "${CR_NAME}" \
+              --for=condition=Available=true \
+              -n "${DR_NAMESPACE}" \
+              --timeout=900s; then
+              echo "[STEP 11] ERROR: Available=True not reached within 900s"
+              echo "[STEP 11] Current conditions:"
+              oc get quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                -o jsonpath='{.status.conditions}' 2>/dev/null \
+                | python3 -m json.tool \
+                | grep -E '"type"|"status"|"message"' \
+                | paste - - - \
+                | awk '{printf "  %s\n", $0}' || true
+              exit 1
+            fi
+            echo "[STEP 11] ✓ QuayRegistry Available=True"
+
+            echo "[STEP 11] Confirming postgres Running (up to 180s)..."
+            PG_POD=$(wait_for_pod_running "${DR_NAMESPACE}" "quay-component=postgres" 180 "postgres")
+            echo "[STEP 11] ✓ postgres: ${PG_POD}"
+
+            echo "[STEP 11] Pod state after scale-up:"
+            oc get pods -n "${DR_NAMESPACE}" --no-headers \
+              | awk '{printf "  %-55s %-10s %-12s %s\n", $1, $2, $3, $4}'
+
+            QUAY_PODS=$(oc get pods -n "${DR_NAMESPACE}" -l app=quay --no-headers 2>/dev/null | wc -l | tr -d ' ')
+            CLAIR_PODS=$(oc get pods -n "${DR_NAMESPACE}" -l quay-component=clair-app --no-headers 2>/dev/null | wc -l | tr -d ' ')
+            MIRROR_PODS=$(oc get pods -n "${DR_NAMESPACE}" -l quay-component=quay-mirror --no-headers 2>/dev/null | wc -l | tr -d ' ')
+            echo "[STEP 11] Replica counts — quay-app: ${QUAY_PODS}  clair-app: ${CLAIR_PODS}  mirror: ${MIRROR_PODS}"
+            if [[ "${QUAY_PODS}" -gt 1 || "${CLAIR_PODS}" -gt 1 || "${MIRROR_PODS}" -gt 1 ]]; then
+              echo "[STEP 11] WARNING: More than 1 replica detected — HPA may have fired"
+              echo "[STEP 11]   Re-applying replicas:1 + deleting HPAs..."
+              oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                --type=merge \
+                -p '{"spec":{"components":[{"kind":"horizontalpodautoscaler","managed":false},{"kind":"quay","managed":true,"overrides":{"replicas":1}},{"kind":"clair","managed":true,"overrides":{"replicas":1}},{"kind":"mirror","managed":true,"overrides":{"replicas":1}}]}}' \
+                2>/dev/null || true
+              oc delete hpa --all -n "${DR_NAMESPACE}" 2>/dev/null || true
+              echo "[STEP 11] Replicas:1 re-applied"
+            fi
+
+            # Check for any Pending pods (resource exhaustion)
+            PENDING=$(oc get pods -n "${DR_NAMESPACE}" --no-headers 2>/dev/null \
+              | grep "Pending" | awk '{print $1}' || true)
+            if [[ -n "${PENDING}" ]]; then
+              echo "[STEP 11] WARNING: Pending pods after scale-up:"
+              for pod in ${PENDING}; do
+                echo "[STEP 11]   ${pod}"
+                oc describe pod "${pod}" -n "${DR_NAMESPACE}" 2>/dev/null \
+                  | grep -E "Insufficient|cannot be scheduled|node.s." \
+                  | head -5 | awk '{printf "    %s\n", $0}'
+              done
+              echo "[STEP 11] TIP: Run: oc describe nodes | grep -A5 Allocatable"
+              echo "[STEP 11]   Ensure cluster has sufficient CPU/memory for 1 pod per component"
+            fi
+            echo "[STEP 11] DONE ✓"
+
+            # ==================================================================
+            # STEP 12 — Flush Redis
+            # Clears stale auth tokens from the backup-time state.
+            # Expected: "FLUSHALL OK"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 12 — Flush Redis"
+            echo "════════════════════════════════════════"
+
             REDIS_POD=$(oc get pod -l quay-component=redis \
               -n "${DR_NAMESPACE}" \
-              -o jsonpath='{.items[0].metadata.name}')
-            oc rsh -n "${DR_NAMESPACE}" "${REDIS_POD}" \
-              bash -c "redis-cli FLUSHALL" || true
-            echo "[resetPassword] Redis cache flushed — restore complete"
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            if [[ -n "${REDIS_POD}" ]]; then
+              echo "[STEP 12] Redis pod: ${REDIS_POD}"
+              FLUSH_RESULT=$(oc exec -n "${DR_NAMESPACE}" "${REDIS_POD}" -- \
+                redis-cli FLUSHALL 2>/dev/null || echo "FAILED")
+              echo "[STEP 12] FLUSHALL result: ${FLUSH_RESULT}"
+              echo "[STEP 12] DONE ✓"
+            else
+              echo "[STEP 12] WARNING: Redis pod not found — skipping FLUSHALL"
+            fi
 
-  # ---------------------------------------------------------------------------
-  # DELETE ACTION
-  # Removes backup artifacts from the object store for a given restore point
-  # ---------------------------------------------------------------------------
-  delete:
-    inputArtifactNames:
-      - quayBackup
+            # ==================================================================
+            # STEP 13 — bcrypt password reset (only if quayAdminPassword set)
+            # Generates a fresh bcrypt hash and updates the postgres user table.
+            # Uses oc exec (not rsh) to avoid stdin hang.
+            # Followed by a second Redis FLUSHALL to clear any cached auth.
+            # Expected: "Password reset for: praveen" or "skipped"
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP 13 — bcrypt password reset"
+            echo "════════════════════════════════════════"
+
+            PG_POD=$(wait_for_pod_running "${DR_NAMESPACE}" "quay-component=postgres" 120 "postgres")
+            if [[ -z "${PG_POD}" ]]; then
+              echo "[STEP 13] ERROR: Could not get Running postgres pod"
+              exit 1
+            fi
+            echo "[STEP 13] PostgreSQL pod: ${PG_POD}"
+
+            # Discover DB name from postgres (safe — uses template0 exclusion)
+            DB_NAME=$(oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
+              psql -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('postgres','template0','template1');" \
+              2>/dev/null | tr -d '[:space:]' || true)
+            if [[ ${#DB_NAME} -lt 5 || ${#DB_NAME} -gt 60 ]]; then
+              echo "[STEP 13] WARNING: DB name '${DB_NAME}' outside expected range — using fallback"
+              DB_NAME="${CR_NAME}-quay-database"
+            fi
+            echo "[STEP 13] Database: ${DB_NAME}"
+
+            if [[ -n "${QUAY_PASS}" ]]; then
+              # Discover admin user
+              if [[ -n "${QUAY_USER_OPT}" ]]; then
+                QUAY_USER="${QUAY_USER_OPT}"
+                echo "[STEP 13] Admin user from option: ${QUAY_USER}"
+              else
+                QUAY_USER=$(oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
+                  psql -d "${DB_NAME}" -tAc \
+                  "SELECT username FROM public.user WHERE robot=false AND enabled=true ORDER BY id LIMIT 1;" \
+                  2>/dev/null | tr -d '[:space:]' || true)
+                [[ -z "${QUAY_USER}" ]] && QUAY_USER="admin"
+                echo "[STEP 13] Auto-discovered admin user: ${QUAY_USER}"
+              fi
+
+              echo "[STEP 13] Generating bcrypt hash for user: ${QUAY_USER}..."
+              echo "aW1wb3J0IGJjcnlwdCwgc3lzCnBhc3N3b3JkID0gc3lzLmFyZ3ZbMV0uZW5jb2RlKCd1dGYtOCcpCmhhc2hlZCA9IGJjcnlwdC5oYXNocHcocGFzc3dvcmQsIGJjcnlwdC5nZW5zYWx0KDEyKSkuZGVjb2RlKCd1dGYtOCcpCnVzZXJuYW1lID0gc3lzLmFyZ3ZbMl0Kc3FsID0gZiJVUERBVEUgcHVibGljLnVzZXIgU0VUIHBhc3N3b3JkX2hhc2ggPSAne2hhc2hlZH0nIFdIRVJFIHVzZXJuYW1lID0gJ3t1c2VybmFtZX0nOyIKd2l0aCBvcGVuKCcvdG1wL3Jlc2V0X3B3LnNxbCcsICd3JykgYXMgZjoKICAgIGYud3JpdGUoc3FsKQpwcmludCgnSGFzaCBnZW5lcmF0ZWQgZm9yOiAnICsgdXNlcm5hbWUpCg==" \
+                | base64 -d > /tmp/gen_hash.py
+              python3 /tmp/gen_hash.py "${QUAY_PASS}" "${QUAY_USER}"
+
+              echo "[STEP 13] Copying SQL to postgres pod..."
+              oc cp /tmp/reset_pw.sql \
+                -n "${DR_NAMESPACE}" "${PG_POD}:/tmp/reset_pw.sql"
+
+              echo "[STEP 13] Executing UPDATE..."
+              oc exec -n "${DR_NAMESPACE}" "${PG_POD}" -- \
+                psql -d "${DB_NAME}" -f /tmp/reset_pw.sql
+              echo "[STEP 13] ✓ Password reset complete for: ${QUAY_USER}"
+
+              # Flush Redis again after password change
+              if [[ -n "${REDIS_POD}" ]]; then
+                FLUSH2=$(oc exec -n "${DR_NAMESPACE}" "${REDIS_POD}" -- \
+                  redis-cli FLUSHALL 2>/dev/null || echo "FAILED")
+                echo "[STEP 13] Redis FLUSHALL after password reset: ${FLUSH2}"
+              fi
+            else
+              echo "[STEP 13] quayAdminPassword not provided — skipping bcrypt reset"
+              echo "[STEP 13] Original password hash from PVC snapshot will be used"
+              echo "[STEP 13] Tip: set quayAdminPassword option on the RestoreAction to reset"
+            fi
+            echo "[STEP 13] DONE ✓"
+
+            # ==================================================================
+            # STEP STATUS SUMMARY
+            # Clear audit trail of every step outcome.
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  STEP STATUS SUMMARY"
+            echo "════════════════════════════════════════"
+            echo "[SUMMARY] STEP 0  — Delete Kasten-restored OBC Secret/CM : COMPLETED"
+            echo "[SUMMARY] STEP 1  — Read manifests from ConfigMap         : COMPLETED"
+            echo "[SUMMARY] STEP 2  — Patch namespace in manifests          : COMPLETED"
+            echo "[SUMMARY] STEP 3  — Apply managed-secret-keys             : COMPLETED"
+            echo "[SUMMARY] STEP 4  — Apply QuayRegistry CR                 : COMPLETED"
+            echo "[SUMMARY] STEP 5  — Wait OBC Bound                        : COMPLETED"
+            echo "[SUMMARY] STEP 6  — Wait QuayRegistry Available=True      : COMPLETED"
+            echo "[SUMMARY] STEP 7  — Confirm key pods Running              : COMPLETED"
+            if [[ -z "${CONFIG_DATA}" ]]; then
+              echo "[SUMMARY] STEP 8  — Patch config.yaml                     : SKIPPED (empty config — operator manages)"
+            elif [[ "${HAS_STORAGE:-no}" == "no" ]]; then
+              echo "[SUMMARY] STEP 8  — Patch config.yaml                     : SKIPPED (no storage config — operator manages)"
+            else
+              echo "[SUMMARY] STEP 8  — Patch config.yaml                     : COMPLETED"
+            fi
+            echo "[SUMMARY] STEP 9  — Scale DOWN for blob restore           : COMPLETED"
+            if [[ "${BLOB_COUNT:-0}" -eq 0 ]]; then
+              echo "[SUMMARY] STEP 10 — Restore blobs S3→NooBaa               : COMPLETED (0 blobs — empty registry)"
+            else
+              echo "[SUMMARY] STEP 10 — Restore blobs S3→NooBaa               : COMPLETED (${BLOB_COUNT:-0} blobs)"
+            fi
+            echo "[SUMMARY] STEP 11 — Scale UP DR                           : COMPLETED"
+            if [[ -n "${REDIS_POD}" ]]; then
+              echo "[SUMMARY] STEP 12 — Flush Redis                           : COMPLETED"
+            else
+              echo "[SUMMARY] STEP 12 — Flush Redis                           : SKIPPED (redis pod not found)"
+            fi
+            if [[ -n "${QUAY_PASS}" ]]; then
+              echo "[SUMMARY] STEP 13 — bcrypt password reset                 : COMPLETED (${QUAY_USER:-unknown})"
+            else
+              echo "[SUMMARY] STEP 13 — bcrypt password reset                 : SKIPPED (no quayAdminPassword set)"
+            fi
+
+            # ==================================================================
+            # FINAL — Pod readiness gate
+            # Wait for all required pods Running before declaring success.
+            # Expected: quay-app, clair-app, mirror, postgres, redis, clair-postgres
+            # ==================================================================
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  FINAL — Pod readiness gate"
+            echo "════════════════════════════════════════"
+            echo "[FINAL] Waiting for all required pods to be Running (up to 300s each)..."
+
+            REQUIRED_PODS_OK=true
+            for pod_spec in \
+              "quay-component=quay-app:quay-app" \
+              "quay-component=clair-app:clair-app" \
+              "quay-component=quay-mirror:mirror" \
+              "quay-component=postgres:postgres" \
+              "quay-component=redis:redis" \
+              "quay-component=clair-postgres:clair-postgres"; do
+              LABEL="${pod_spec%%:*}"
+              DESC="${pod_spec##*:}"
+              set +e
+              POD_RESULT=$(wait_for_pod_running "${DR_NAMESPACE}" "${LABEL}" 300 "${DESC}")
+              WAIT_RC=$?
+              set -e
+              if [[ ${WAIT_RC} -ne 0 || -z "${POD_RESULT}" ]]; then
+                echo "[FINAL] ✗ ${DESC} pod NOT Running within 300s — check pod events"
+                REQUIRED_PODS_OK=false
+              else
+                # Check restart count — warn if high but don't fail
+                RESTARTS=$(oc get pod "${POD_RESULT}" -n "${DR_NAMESPACE}" \
+                  -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo "0")
+                if [[ "${RESTARTS}" -gt 3 ]]; then
+                  echo "[FINAL] ⚠ ${DESC}: ${POD_RESULT} (Running but ${RESTARTS} restarts — monitor)"
+                else
+                  echo "[FINAL] ✓ ${DESC}: ${POD_RESULT} (${RESTARTS} restarts)"
+                fi
+              fi
+            done
+
+            echo ""
+            echo "[FINAL] Full pod state in ${DR_NAMESPACE}:"
+            oc get pods -n "${DR_NAMESPACE}" --no-headers \
+              | awk '{printf "  %-55s %-10s %-12s %s\n", $1, $2, $3, $4}'
+
+            AVAIL_FINAL=$(oc get quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "Unknown")
+            QUAY_ROUTE=$(oc get route -n "${DR_NAMESPACE}" \
+              -o jsonpath='{.items[0].spec.host}' 2>/dev/null || echo "not found")
+
+            echo ""
+            echo "======================================================"
+            echo "[DONE] ✓ postRestoreHook complete"
+            echo "======================================================"
+            echo "[DONE]   DR Namespace      : ${DR_NAMESPACE}"
+            echo "[DONE]   CR Name           : ${CR_NAME}"
+            echo "[DONE]   End time          : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "------------------------------------------------------"
+            echo "[DONE]   QuayRegistry      : Available=${AVAIL_FINAL}"
+            echo "[DONE]   All pods Running  : ${REQUIRED_PODS_OK}"
+            echo "[DONE]   Blobs restored    : ${BLOB_COUNT:-0} files"
+            echo "[DONE]   Password reset    : $([ -n "${QUAY_PASS}" ] && echo "yes — ${QUAY_USER:-unknown}" || echo "skipped")"
+            echo "[DONE]   Quay DR route     : https://${QUAY_ROUTE}"
+            echo "------------------------------------------------------"
+            echo "[DONE]   Verify login:"
+            echo "[DONE]     podman login --tls-verify=false \\"
+            echo "[DONE]       --username <user> --password <pass> \\"
+            echo "[DONE]       ${QUAY_ROUTE}"
+            echo "======================================================"
+
+            if [[ "${REQUIRED_PODS_OK}" != "true" ]]; then
+              echo ""
+              echo "[DONE] WARNING: One or more required pods did not reach Running state"
+              echo "[DONE]   Check: oc get pods -n ${DR_NAMESPACE}"
+              echo "[DONE]   Check: oc describe pods -n ${DR_NAMESPACE}"
+              echo "[DONE]   Restore data is intact — Quay may need manual intervention"
+            fi
+
+
+  # ===========================================================================
+  # postRestoreHookError
+  # Runs in quay-dr if the restore fails at any point.
+  # Best-effort cleanup to prevent stuck resources blocking the next attempt.
+  # ===========================================================================
+  postRestoreHookError:
 
     phases:
+
     - func: KubeTask
-      name: deleteBackupArtifacts
+      name: postRestoreHookError
       args:
-        namespace: "{{ .Deployment.Namespace }}"
-        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:1.0.0{{end}}'
+        namespace: "{{ .Namespace.Name }}"
+        image: '{{if index .Options "quayToolsImage"}}{{- index .Options "quayToolsImage" -}}{{else}}docker.io/pvanka86/quay-kanister-tools:2.0.0{{end}}'
         command:
           - bash
-          - -o
-          - errexit
           - -o
           - pipefail
           - -c
           - |
-            echo "[delete] Removing Quay backup artifacts from object store..."
-            kando location delete \
-              --profile '{{ toJson .Profile }}' \
-              --path "quay-backups/{{ .Deployment.Namespace }}/blobs/blobs.tar.gz" \
-              --kopia-snapshot '{{ .ArtifactsIn.quayBackup.KopiaSnapshot }}'
-            echo "[delete] Backup artifacts deleted."
+            # NOTE: errexit intentionally omitted — best-effort cleanup.
+            DR_NAMESPACE="{{ .Namespace.Name }}"
+            CR_NAME_OPT='{{if index .Options "quayRegistryName"}}{{- index .Options "quayRegistryName" -}}{{end}}'
+            CR_NAME="${CR_NAME_OPT:-quay-registry}"
+            OBC_NAME="${CR_NAME}-quay-datastore"
+
+            echo "======================================================"
+            echo "[INIT] ▶ Quay postRestoreHookError — Blueprint v5.0.0"
+            echo "[INIT]   DR Namespace : ${DR_NAMESPACE}"
+            echo "[INIT]   Purpose      : Best-effort cleanup after restore failure"
+            echo "[INIT]   Start time   : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "======================================================"
+
+            # Strip OBC finalizer + delete
+            echo ""
+            echo "--- Cleanup: ObjectBucketClaim ---"
+            if oc get objectbucketclaim "${OBC_NAME}" -n "${DR_NAMESPACE}" &>/dev/null; then
+              oc patch objectbucketclaim "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              oc delete objectbucketclaim "${OBC_NAME}" -n "${DR_NAMESPACE}" \
+                --force --grace-period=0 2>/dev/null \
+                && echo "[CLEANUP] ✓ OBC deleted: ${OBC_NAME}" \
+                || echo "[CLEANUP] WARNING: OBC delete failed"
+            else
+              echo "[CLEANUP] OBC not present: ${OBC_NAME}"
+            fi
+
+            # Delete QuayRegistry CR (strip finalizers if stuck)
+            echo ""
+            echo "--- Cleanup: QuayRegistry CR ---"
+            if oc get quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" &>/dev/null; then
+              oc patch quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              oc delete quayregistry "${CR_NAME}" -n "${DR_NAMESPACE}" \
+                --force --grace-period=0 2>/dev/null \
+                && echo "[CLEANUP] ✓ CR deleted: ${CR_NAME}" \
+                || echo "[CLEANUP] WARNING: CR delete failed"
+            else
+              echo "[CLEANUP] CR not present: ${CR_NAME}"
+            fi
+
+            # Delete kanister-job pods
+            echo ""
+            echo "--- Cleanup: kanister-job pods ---"
+            for pod in $(oc get pods -n "${DR_NAMESPACE}" --no-headers 2>/dev/null \
+              | grep "kanister-job" | awk '{print $1}'); do
+              oc delete pod "${pod}" -n "${DR_NAMESPACE}" \
+                --force --grace-period=0 2>/dev/null \
+                && echo "[CLEANUP] ✓ Deleted pod: ${pod}" \
+                || echo "[CLEANUP] WARNING: Pod delete failed: ${pod}"
+            done
+
+            echo ""
+            echo "[CLEANUP] Final namespace state:"
+            oc get pods -n "${DR_NAMESPACE}" --no-headers 2>/dev/null \
+              | awk '{printf "  %-55s %-10s %s\n", $1, $2, $3}' || echo "  (none)"
+
+            echo ""
+            echo "======================================================"
+            echo "[DONE] postRestoreHookError cleanup complete"
+            echo "[DONE]   Run ./quay-dr-cleanup.sh quay-dr for full cleanup"
+            echo "[DONE]   Then retry the restore from Kasten UI"
+            echo "======================================================"

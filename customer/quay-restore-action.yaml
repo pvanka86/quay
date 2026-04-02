@@ -1,0 +1,72 @@
+# =============================================================================
+# Kasten RestoreAction — Red Hat Quay Operator
+# Blueprint: quay-kanister-blueprint v6.0.0
+# Kasten: 8.5.5 | Quay: 3.13.2
+# =============================================================================
+#
+# USAGE:
+#   1. Run a backup policy first to create a restore point
+#   2. Get the latest restore point name:
+#        kubectl get restorepoints -n quay \
+#          --sort-by='.metadata.creationTimestamp' --no-headers | tail -1
+#   3. Fill in the three <required> fields below
+#   4. Apply:
+#        kubectl create -f quay-restore-action.yaml
+#   5. Monitor in Kasten UI or via:
+#        kubectl get restoreactions -n kasten-io -w
+#
+# HOOKS:
+#   preHook    → preRestoreHook   (cleans stale resources before restore)
+#   onSuccess  → postRestoreHook  (bootstraps operator, restores blobs, scales up)
+#   onFailure  → postRestoreHookError (best-effort cleanup on failure)
+#
+# OPTIONS (all optional — defaults are safe for most environments):
+#   quayToolsImage    Override container image
+#                     Default: docker.io/pvanka86/quay-kanister-tools:2.0.0
+#   quayRegistryName  QuayRegistry CR name (default: auto-discovered)
+#   sourceNamespace   Namespace backup was taken from (default: quay)
+#   quayAdminUser     Admin username for password reset (default: auto-discovered)
+#   quayAdminPassword Admin password for bcrypt reset — if not set, original
+#                     hash from PVC snapshot is used. Recommended to set via
+#                     quay-kanister-credentials secret instead of here.
+#   objectStorageType noobaa (default) | external | none
+#   noobaaNamespace   ODF namespace (default: openshift-storage)
+#   postgresManaged   true (default) | false — false = external postgres
+#   redisManaged      true (default) | false — false = external redis
+#   clairManaged      true (default) | false — false = external clair
+#   drReplicas        Replicas on DR scale-up (default: 1)
+#   blobSyncEnabled   true (default) | false
+# =============================================================================
+apiVersion: actions.kio.kasten.io/v1alpha1
+kind: RestoreAction
+metadata:
+  generateName: quay-restore-
+  namespace: kasten-io
+spec:
+  subject:
+    apiVersion: apps.kio.kasten.io/v1alpha1
+    kind: RestorePoint
+    name: <your-restore-point-name>      # required — e.g. scheduled-t4pj4
+    namespace: quay                      # required — namespace restore point lives in
+  targetNamespace: quay-dr              # required — DR namespace to restore into
+
+  hooks:
+    preHook:
+      blueprint: quay-kanister-blueprint
+      actionName: preRestoreHook
+    onSuccess:
+      blueprint: quay-kanister-blueprint
+      actionName: postRestoreHook
+    onFailure:
+      blueprint: quay-kanister-blueprint
+      actionName: postRestoreHookError
+
+  # kanisterOptions are optional — blueprint reads credentials from
+  # quay-kanister-credentials secret in the target namespace by default.
+  # Uncomment and set only what you need to override:
+  # kanisterOptions:
+  #   quayToolsImage: "docker.io/pvanka86/quay-kanister-tools:2.0.0"
+  #   sourceNamespace: "quay"
+  #   quayRegistryName: "quay-registry"
+  #   drReplicas: "1"
+  #   objectStorageType: "noobaa"

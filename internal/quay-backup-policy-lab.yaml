@@ -1,0 +1,58 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: Policy
+metadata:
+  name: quay-backup-lab
+  namespace: kasten-io
+spec:
+  actions:
+  - action: backup
+    backupParameters:
+      filters:
+        excludeResources:
+        - group: operators.coreos.com
+          name: ""
+          resource: subscriptions
+          version: v1alpha1
+        - group: operators.coreos.com
+          name: ""
+          resource: operatorgroups
+          version: v1
+        - group: operators.coreos.com
+          name: ""
+          resource: clusterserviceversions
+          version: v1alpha1
+        - group: operators.coreos.com
+          name: ""
+          resource: installplans
+          version: v1alpha1
+        - name: ""
+          resource: horizontalpodautoscalers
+        - name: ""
+          resource: objectbucketclaims
+        - name: ""
+          resource: reclaimspacejobs
+        - name: ""
+          resource: reclaimspacecronjobs
+        - name: ""
+          resource: datasources
+        - group: operators.coreos.com
+          name: ""
+          resource: operatorconditions
+          version: v2
+      hooks:
+        onSuccess:
+          actionName: postBackupHook
+          blueprint: quay-kanister-blueprint-lab
+        preHook:
+          actionName: preBackupHook
+          blueprint: quay-kanister-blueprint-lab
+      profile:
+        name: kasten-se-lab-baremetal-s3
+        namespace: kasten-io
+  frequency: '@onDemand'
+  selector:
+    matchExpressions:
+    - key: k10.kasten.io/appNamespace
+      operator: In
+      values:
+      - quay

@@ -1,44 +1,27 @@
 # =============================================================================
-# quay-kanister-tools — Multi-stage Dockerfile
-# =============================================================================
-# Stage 1: extract kando binary from the official kanister-tools image
-# Stage 2: build final image on UBI9 (full package manager, no conflicts)
+# quay-kanister-tools:2.0.0
+# Tools image for the Quay Operator Kanister Blueprint
 #
-# Why multi-stage?
-#   - kanister-tools is distroless (no package manager, no tar, no shell utils)
-#   - UBI9 has dnf and all the tools we need, but no kando
-#   - Multi-stage gives us both: copy kando from stage 1 into stage 2
+# Contains:
+#   - oc      (OpenShift CLI 4.14 — matches OCP 4.x)
+#   - kubectl (bundled with oc)
+#   - python3 + PyYAML + bcrypt  (manifest cleanup, bcrypt password reset)
+#   - aws CLI v2                 (NooBaa ↔ external S3 blob sync)
+#   - bash, curl, tar, gzip, jq (general scripting utilities)
 #
 # Build:
-#   podman build --platform linux/amd64 \
-#     -t docker.io/${REGISTRY_USER}/quay-kanister-tools:1.0.0 \
-#     -f 05_Dockerfile .
+#   podman build -t docker.io/pvanka86/quay-kanister-tools:2.0.0 .
+#   podman push docker.io/pvanka86/quay-kanister-tools:2.0.0
+#
+# OpenShift compatibility:
+#   - Runs as non-root (USER 65532) by default
+#   - runAsUser: 0 override used by Kasten KubeTask pods (podOverride in policy)
 # =============================================================================
 
-# ---------------------------------------------------------------------------
-# Stage 1 — extract kando from the official distroless kanister-tools image
-# ---------------------------------------------------------------------------
-FROM ghcr.io/kanisterio/kanister-tools:0.118.0 AS kanister-source
-
-# ---------------------------------------------------------------------------
-# Stage 2 — final image built on UBI9 (full dnf package manager)
-# ---------------------------------------------------------------------------
 FROM registry.access.redhat.com/ubi9/ubi:latest
 
-LABEL maintainer="your-team@example.com" \
-      description="Kanister Blueprint image for Red Hat Quay Operator" \
-      quay.version="3.13.x" \
-      kanister.version="0.118.0"
-
-ARG OC_VERSION="4.14"
-
 # ---------------------------------------------------------------------------
-# Step 1 — copy kando binary from stage 1
-# ---------------------------------------------------------------------------
-COPY --from=kanister-source /usr/local/bin/kando /usr/local/bin/kando
-
-# ---------------------------------------------------------------------------
-# Step 2 — install system packages (dnf available on UBI9)
+# System packages
 # ---------------------------------------------------------------------------
 RUN dnf install -y --allowerasing \
       bash \
@@ -49,60 +32,55 @@ RUN dnf install -y --allowerasing \
       jq \
       python3 \
       python3-pip \
-      openssl \
       ca-certificates \
+      less \
       findutils \
-    && dnf clean all
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
 
 # ---------------------------------------------------------------------------
-# Step 3 — PyYAML for YAML manifest cleanup in Blueprint phases
+# Python packages — PyYAML for manifest cleanup, bcrypt for password reset
 # ---------------------------------------------------------------------------
-RUN pip3 install --no-cache-dir PyYAML==6.0.1
+RUN pip3 install --no-cache-dir \
+      PyYAML==6.0.2 \
+      bcrypt==4.2.1
 
 # ---------------------------------------------------------------------------
-# Step 4 — oc + kubectl from OpenShift mirror (amd64, matches --platform)
+# OpenShift CLI (oc) — 4.14 stable, linux amd64
+# Provides both `oc` and `kubectl`
 # ---------------------------------------------------------------------------
 RUN curl -fsSL \
-      "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-${OC_VERSION}/openshift-client-linux.tar.gz" \
+      "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-4.14/openshift-client-linux.tar.gz" \
       -o /tmp/oc.tar.gz \
-    && tar -xzf /tmp/oc.tar.gz -C /usr/local/bin oc kubectl \
+    && tar -C /usr/local/bin -xzf /tmp/oc.tar.gz oc kubectl \
     && rm /tmp/oc.tar.gz \
     && oc version --client \
     && kubectl version --client
 
 # ---------------------------------------------------------------------------
-# Step 5 — AWS CLI v2 (amd64, matches --platform linux/amd64)
+# AWS CLI v2 — official installer, linux x86_64
+# Supports --endpoint-url and --no-verify-ssl required for NooBaa S3
 # ---------------------------------------------------------------------------
 RUN curl -fsSL \
       "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
       -o /tmp/awscliv2.zip \
     && unzip -q /tmp/awscliv2.zip -d /tmp \
     && /tmp/aws/install \
-    && rm -rf /tmp/aws /tmp/awscliv2.zip \
+    && rm -rf /tmp/awscliv2.zip /tmp/aws \
     && aws --version
 
 # ---------------------------------------------------------------------------
-# Step 6 — Smoke test: verify ALL tools are present and executable
+# Verification — fail the build if any tool is missing
 # ---------------------------------------------------------------------------
-RUN echo "=== Verifying all tools ===" \
-    && oc version --client \
-    && kubectl version --client \
+RUN oc version --client \
+    && python3 -c "import yaml; import bcrypt; print('Python packages OK')" \
     && aws --version \
-    && kando --help 2>&1 | head -1 \
-    && python3 -c "import yaml; print('PyYAML OK:', yaml.__version__)" \
-    && echo "=== All tools verified ==="
+    && echo "All tools verified"
 
 # ---------------------------------------------------------------------------
-# Non-root user — OCP runs containers as arbitrary UIDs
+# Runtime — run as non-root by default
+# Kasten overrides to root via podOverride.securityContext.runAsUser: 0
 # ---------------------------------------------------------------------------
-RUN useradd -u 1001 -r -g 0 -s /sbin/nologin \
-      -c "Blueprint runner" kanister \
-    && mkdir -p /home/kanister \
-    && chown -R 1001:0 /home/kanister \
-    && chmod -R g=u /home/kanister
-
-USER 1001
-WORKDIR /home/kanister
+USER 65532
 
 ENTRYPOINT ["/bin/bash"]
-CMD ["-c", "echo 'quay-kanister-tools ready' && oc version --client && aws --version && kando --help 2>&1 | head -1"]

@@ -47,10 +47,12 @@ rules:
     resources: ["pods/attach"]
     verbs: ["create", "get"]
 
-  # ConfigMaps — NooBaa BUCKET_NAME lookup
+  # ConfigMaps — NooBaa BUCKET_NAME lookup (get/list)
+  #              quay-kanister-backup-manifests create/update during backup (create/update/patch)
+  #              read on restore (get/list already covered)
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
 
   # Routes — S3 endpoint lookup (openshift-storage)
   - apiGroups: ["route.openshift.io"]
