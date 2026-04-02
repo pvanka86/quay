@@ -1,42 +1,40 @@
-# RH Quay Operator — Kasten Blueprint
+# Red Hat Quay Operator — Veeam Kasten Backup & Restore
 
-Kanister Blueprint for backup and restore of Red Hat Quay Operator 3.13.2
-on OpenShift Container Platform using Veeam Kasten.
+Kanister Blueprint for backup and restore of Red Hat Quay Operator on
+OpenShift Container Platform using Veeam Kasten.
 
 ## Repository Structure
+
 ```
-├── customer/                             # Customer-facing files
-│   ├── Dockerfile                        # Build the quay-kanister-tools image
-│   ├── quay-kanister-blueprint.yaml      # Production Kanister Blueprint v2.1.0
-│   ├── quay-kanister-rbac.yaml           # RBAC for Kanister pod permissions
-│   └── docs/
-│       └── backup_restore_runbook.md     # Full backup & restore runbook
+├── customer/                              # Customer and production files
+│   ├── README.md                          # Full customer guide — start here
+│   ├── quay-kanister-blueprint.yaml       # Production blueprint v6.0.0
+│   ├── quay-kanister-rbac.yaml            # RBAC for Kanister pod permissions
+│   ├── quay-kanister-credentials.yaml     # Admin credentials secret template
+│   ├── quay-backup-policy.yaml            # Kasten backup policy template
+│   ├── quay-restore-action.yaml           # Kasten RestoreAction template
+│   ├── quay-dr-cleanup.sh                 # DR namespace cleanup script
+│   └── Dockerfile                         # Builds quay-kanister-tools image
 │
-└── internal/                             # Internal/lab use only
-    ├── quay-kanister-blueprint-lab.yaml  # Lab blueprint (replicas:1, HPA suppression)
-    ├── scripts/
-    │   ├── quay_install_setup.sh         # Quay installation steps
-    │   ├── quay_backup.sh                # Manual backup script
-    │   ├── quay_restore.sh               # Manual restore script
-    │   └── test-app-dr-deploy.sh         # DR test app deployment
-    ├── actionsets/
-    │   └── quay-actionsets.yaml          # Kanister ActionSet examples
-    └── test-apps/
-        ├── test-app-source.yaml          # Source registry test app
-        └── test-app-dr.yaml              # DR registry test app
+└── internal/                              # SE lab and internal use only
+    ├── README.md                          # Internal guide
+    ├── quay-kanister-blueprint-lab.yaml   # Lab blueprint v5
+    ├── quay-backup-policy-lab.yaml        # Lab backup policy
+    └── quay_e2e_test.sh                   # End-to-end automated test script
 ```
 
 ## Quick Start
 
-See [customer/docs/backup_restore_runbook.md](customer/docs/backup_restore_runbook.md)
-for complete backup and restore instructions.
+See **[customer/README.md](customer/README.md)** for the full guide including
+prerequisites, setup steps, backup and restore walkthroughs, all options,
+and troubleshooting.
 
 ## Validated Environment
 
 | Component | Version |
 |---|---|
 | Red Hat Quay | 3.13.2 |
-| OpenShift | 4.14 |
-| Veeam Kasten | 8.5.4 |
-| Kanister | 0.118.0 |
-| kanister-tools image | docker.io/pvanka86/quay-kanister-tools:1.0.0 |
+| Quay Operator | 3.13.2 |
+| OpenShift Container Platform | 4.14+ |
+| Veeam Kasten | 8.5.5 |
+| quay-kanister-tools image | `docker.io/pvanka86/quay-kanister-tools:2.0.0` |
