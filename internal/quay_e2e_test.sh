@@ -54,7 +54,14 @@ fi
 EXT_S3_ENDPOINT="https://s3.us-east-2.amazonaws.com"
 TEST_IMAGE="docker.io/library/alpine:latest"
 TEST_IMAGE_TAG="alpine:latest"
-CLEANUP_SCRIPT="${SCRIPT_DIR}/../quay-dr-cleanup.sh"
+# Locate cleanup script — works in both blueprint-files/internal/ and repo/internal/
+if [[ -f "${SCRIPT_DIR}/../quay-dr-cleanup.sh" ]]; then
+  CLEANUP_SCRIPT="${SCRIPT_DIR}/../quay-dr-cleanup.sh"
+elif [[ -f "${SCRIPT_DIR}/../customer/quay-dr-cleanup.sh" ]]; then
+  CLEANUP_SCRIPT="${SCRIPT_DIR}/../customer/quay-dr-cleanup.sh"
+else
+  CLEANUP_SCRIPT="${SCRIPT_DIR}/../quay-dr-cleanup.sh"  # will warn if missing
+fi
 
 # Timeouts (seconds)
 BACKUP_TIMEOUT=900
