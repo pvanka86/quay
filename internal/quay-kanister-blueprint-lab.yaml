@@ -1422,15 +1422,22 @@ actions:
                 -n "${DR_NAMESPACE}" \
                 -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' 2>/dev/null || true)
 
-              if [[ "${OBC_PHASE}" == "Bound" ]] || \
-                 [[ -n "${OBC_CM_BUCKET}" && -n "${OBC_SECRET_KEY}" ]]; then
+              # Require ALL THREE to be present with real values:
+              #   1. OBC phase=Bound (or empty on some NooBaa versions)
+              #   2. ConfigMap with non-empty BUCKET_NAME
+              #   3. Secret with non-empty AWS_ACCESS_KEY_ID
+              # Checking phase=Bound alone is insufficient — NooBaa can mark the OBC
+              # Bound without creating the Secret if the bucket already existed from
+              # a prior provision cycle. The operator needs the Secret to proceed.
+              if [[ -n "${OBC_CM_BUCKET}" && -n "${OBC_SECRET_KEY}" ]]; then
                 OBC_BOUND=true
-                echo "[STEP 5] ✓ OBC '${OBC_NAME}' Bound after ${OBC_ELAPSED}s"
+                echo "[STEP 5] ✓ OBC '${OBC_NAME}' fully provisioned after ${OBC_ELAPSED}s"
                 echo "[STEP 5]   Phase         : ${OBC_PHASE:-empty/Bound}"
                 echo "[STEP 5]   NooBaa bucket : ${OBC_CM_BUCKET}"
+                echo "[STEP 5]   Secret        : present with credentials"
                 break
               fi
-              echo "[STEP 5]   OBC phase: ${OBC_PHASE:-empty} cm=${OBC_CM_BUCKET:-none} — waiting 10s... (${OBC_ELAPSED}s/300s)"
+              echo "[STEP 5]   OBC phase: ${OBC_PHASE:-empty} cm=${OBC_CM_BUCKET:-none} secret=${OBC_SECRET_KEY:+present} — waiting 10s... (${OBC_ELAPSED}s/300s)"
               sleep 10
               OBC_ELAPSED=$(( OBC_ELAPSED + 10 ))
             done
